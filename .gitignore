@@ -1,0 +1,27 @@
+# Runtime state — offset.json + logs, never committed (CFG-03 spirit)
+state/
+
+# Transient spike artifacts
+spike/*.ts
+
+# Pester -CI run output (generated test-results artifact, never committed)
+testResults.xml
+
+# Per-run tuned pusher copies dropped by New-TestTunedPusherCopy (tests/TestHelpers.psm1)
+# at the repo root during integration test runs -- disposable, never committed
+/.pusher.integrationtest.*.ps1
+
+# Secret-free repo -- .env holds the SRT target/passphrase locally only (CFG-03)
+.env
+*.env
+!.env.example
+
+# Secret-holding local helpers -- askpass wrappers embed passwords (repo is public)
+tools/bin/askpass*.cmd
+
+# .env backups (hold the SRT passphrase like .env itself)
+.env.bak-*
+
+# Local run logs
+logs/
+tools/logs/

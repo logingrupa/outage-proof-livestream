@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gapless SRT Pusher — Dashboard</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="header-bar">
+    <h1 class="header-title">Gapless SRT Pusher</h1>
+    <div class="header-status">
+      <span id="connection-pill" class="status-pill state-unknown">—</span>
+      <details class="vps-health-details">
+        <summary
+          class="header-metric vps-health-summary"
+          aria-label="VPS relay health — click or hover to see the 5 individual checks"
+        >
+          <span class="header-metric-label">VPS</span>
+          <span id="vps-health-pill" class="status-pill state-unknown">—</span>
+        </summary>
+        <div id="vps-health-detail" class="vps-health-detail" role="status">
+          <div class="vps-health-check-row">
+            <span class="vps-health-check-dot state-unknown"></span>
+            <span class="vps-health-check-label">Ingest</span>
+            <span class="vps-health-check-detail control-helper">—</span>
+          </div>
+          <div class="vps-health-check-row">
+            <span class="vps-health-check-dot state-unknown"></span>
+            <span class="vps-health-check-label">YouTube LV</span>
+            <span class="vps-health-check-detail control-helper">—</span>
+          </div>
+          <div class="vps-health-check-row">
+            <span class="vps-health-check-dot state-unknown"></span>
+            <span class="vps-health-check-label">YouTube RU</span>
+            <span class="vps-health-check-detail control-helper">—</span>
+          </div>
+          <div class="vps-health-check-row">
+            <span class="vps-health-check-dot state-unknown"></span>
+            <span class="vps-health-check-label">Tunnel</span>
+            <span class="vps-health-check-detail control-helper">—</span>
+          </div>
+          <div class="vps-health-check-row">
+            <span class="vps-health-check-dot state-unknown"></span>
+            <span class="vps-health-check-label">Port</span>
+            <span class="vps-health-check-detail control-helper">—</span>
+          </div>
+        </div>
+      </details>
+      <span class="header-metric">
+        <span class="header-metric-label">
+          Behind live
+          <span class="info-affordance" tabindex="0" aria-label="What does behind live mean?">
+            <span aria-hidden="true">(?)</span>
+            <span class="info-tooltip" role="tooltip">How far the stream sent to YouTube is behind the live recording. The disk buffer holds everything — nothing is lost. When sending is faster than recording, this shrinks until the stream catches up.</span>
+          </span>
+        </span>
+        <span id="header-behind-live" class="header-metric-value">—</span>
+      </span>
+      <button
+        id="enable-notifications"
+        type="button"
+        class="btn btn-notifications"
+        hidden
+        title="Get notified in this browser if the stream drops or recovers. Only works while this tab stays open."
+      >Enable Notifications</button>
+    </div>
+    <div class="header-metrics" aria-label="Live stream metrics">
+      <span class="header-metric">
+        <span id="sticky-delay-label" class="header-metric-label">Delay</span>
+        <span id="sticky-delay" class="header-metric-value">—</span>
+      </span>
+      <span class="header-metric">
+        <span id="sticky-send-bitrate-label" class="header-metric-label">Send</span>
+        <span id="sticky-send-bitrate" class="header-metric-value">—</span>
+      </span>
+      <span class="header-metric">
+        <span id="sticky-record-bitrate-label" class="header-metric-label">Record</span>
+        <span id="sticky-record-bitrate" class="header-metric-value">—</span>
+      </span>
+      <span class="header-metric">
+        <span id="sticky-percent-sent-label" class="header-metric-label">Sent</span>
+        <span id="sticky-percent-sent" class="header-metric-value">—</span>
+      </span>
+    </div>
+  </header>
+
+  <div id="stale-banner" class="banner banner-stale" role="status" hidden></div>
+
+  <main>
+    <section id="empty-state" class="panel empty-state" hidden>
+      <h2>Not Streaming</h2>
+      <p>Nothing is being pushed to the relay right now. Press <strong>Start Streaming</strong> to begin.</p>
+    </section>
+
+    <section id="session-finished-panel" class="panel session-finished-panel" hidden>
+      <h2>Service Finished</h2>
+      <p id="session-finished-summary" class="session-finished-summary">—</p>
+      <p class="session-finished-detail">
+        Total session duration: <span id="session-finished-duration">—</span>
+        &nbsp;·&nbsp; Undelivered: <span id="session-finished-undelivered">—</span>
+      </p>
+      <div id="new-recording-notice" class="notice notice-pickup" hidden>
+        <span id="new-recording-notice-text">New recording detected.</span>
+        <button id="btn-pickup-start" type="button" class="btn btn-start" disabled>Start Streaming</button>
+      </div>
+    </section>
+
+    <section class="panel hero-panel" aria-label="Delay behind live">
+      <div class="hero">
+        <span id="delay-value" class="hero-value">—</span>
+      </div>
+      <p id="hero-caption" class="hero-caption">delay behind live</p>
+      <p id="hero-delay-trend" class="hero-trend hero-trend-measuring">measuring…</p>
+
+      <div id="hero-chart" class="hero-chart">
+        <p id="hero-chart-placeholder" class="hero-chart-placeholder">collecting…</p>
+        <div id="hero-chart-body" class="hero-chart-body" hidden>
+          <div class="hero-chart-window-caption"><span id="hero-chart-window-label">last 5m</span></div>
+          <svg id="hero-chart-top" class="hero-chart-svg hero-chart-svg-top" viewBox="0 0 600 90" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <svg id="hero-chart-bottom" class="hero-chart-svg hero-chart-svg-bottom" viewBox="0 0 600 30" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div id="hero-chart-crosshair" class="hero-chart-crosshair" hidden></div>
+          <div id="hero-chart-tooltip" class="hero-chart-tooltip" role="status" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="recording-status-panel" class="panel recording-status-panel" aria-label="Recording status">
+      <p class="recording-status-row">
+        <span class="recording-status-label">Following:</span>
+        <span id="following-file" class="recording-status-file">Not yet resolved</span>
+        <span id="following-badge" class="status-pill" hidden>—</span>
+      </p>
+    </section>
+
+    <section class="panel controls-panel" aria-labelledby="controls-heading">
+      <h2 id="controls-heading">Controls</h2>
+      <div class="controls-row">
+        <button id="btn-start" type="button" class="btn btn-start" disabled>Start Streaming</button>
+        <div class="control-group">
+          <button id="btn-stop" type="button" class="btn btn-stop" disabled>Stop (Drain &amp; Finish)</button>
+          <p class="control-helper">Sends everything already recorded, then stops cleanly.</p>
+        </div>
+        <button id="btn-cut" type="button" class="btn btn-cut" disabled>Cut Now</button>
+      </div>
+    </section>
+
+    <section class="panel catchup-panel" aria-labelledby="catchup-heading">
+      <h2 id="catchup-heading">Upload Speed</h2>
+      <div class="form-field">
+        <label for="ceiling-slider" title="Absolute max push speed. Applies live within about a second — no restart. 0 = off, the catch-up multiplier governs instead.">Max upload speed (<span id="ceiling-slider-value">—</span>)</label>
+        <input type="range" id="ceiling-slider" min="0" max="50" step="0.5" aria-describedby="governing-cap-readout">
+      </div>
+      <div class="form-field">
+        <label for="catchup-slider">Catch-up multiplier (<span id="catchup-slider-value">—</span>x)</label>
+        <input type="range" id="catchup-slider" min="1" max="3" step="0.1" aria-describedby="catchup-effective">
+      </div>
+      <p id="catchup-effective" class="control-helper">effective —</p>
+      <p id="governing-cap-readout" class="control-helper">governing cap: —</p>
+    </section>
+
+    <section class="panel metrics-panel" aria-labelledby="metrics-heading">
+      <h2 id="metrics-heading">Metrics</h2>
+
+      <div class="metrics-group">
+        <p class="metrics-group-caption">Flow</p>
+        <div class="metrics-grid">
+          <div class="metric-row">
+            <span class="metric-label">Send bitrate</span>
+            <span id="metric-send-bitrate" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Record bitrate</span>
+            <span id="metric-record-bitrate" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">NIC upload (wire)</span>
+            <span id="metric-nic-upload" class="metric-value">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="metrics-group">
+        <p class="metrics-group-caption">Position</p>
+        <div class="metrics-grid">
+          <div class="metric-row">
+            <span class="metric-label">Offset / file length</span>
+            <span id="metric-offset" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Catch-up</span>
+            <span id="metric-catchup-ratio" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Catch-up utilization</span>
+            <span id="metric-catchup-utilization" class="metric-value">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="metrics-group">
+        <p class="metrics-group-caption">Connection</p>
+        <div class="metrics-grid">
+          <div class="metric-row">
+            <span class="metric-label">SRT connection state</span>
+            <span id="metric-connection-state" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Reconnects (now streak / this session)</span>
+            <span class="metric-value">
+              <span id="metric-backoff-streak">—</span> / <span id="metric-cumulative-reconnects">—</span>
+            </span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Last send</span>
+            <span id="metric-last-send" class="metric-value">—</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Live for</span>
+            <span id="metric-uptime" class="metric-value">—</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel timeline-panel" aria-labelledby="timeline-heading">
+      <h2 id="timeline-heading">Timeline</h2>
+      <div
+        id="timeline-track"
+        class="timeline-track"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+        aria-label="Sent versus pending backlog"
+      >
+        <div id="timeline-sent" class="timeline-sent"></div>
+      </div>
+      <div class="timeline-labels">
+        <span id="timeline-sent-label" class="timeline-label">—</span>
+        <span id="timeline-pending-label" class="timeline-label">—</span>
+      </div>
+      <div class="timeline-stats">
+        <span class="timeline-stat">Delay behind live: <span id="timeline-delay">—</span></span>
+        <span class="timeline-stat">Drain ETA: <span id="timeline-eta">—</span></span>
+      </div>
+    </section>
+
+    <section id="recording-management-panel" class="panel recording-management-panel" aria-labelledby="recording-management-heading">
+      <h2 id="recording-management-heading">Recording Management</h2>
+
+      <div class="recording-management-subsection">
+        <div class="resume-state-row">
+          <button
+            id="btn-reset-resume"
+            type="button"
+            class="btn btn-reset-resume"
+            disabled
+            title="Stop the pusher before resetting resume state."
+          >Reset Resume State</button>
+          <p class="control-helper">Clears the saved position so the next Start begins fresh on today's newest recording.</p>
+        </div>
+      </div>
+
+      <div class="recording-management-subsection">
+        <h3 class="recordings-heading">Recordings</h3>
+        <div id="recordings-error" class="form-error" role="alert" hidden></div>
+        <div id="recordings-list" class="recordings-list"></div>
+        <p id="recordings-empty" class="recordings-empty" hidden></p>
+      </div>
+    </section>
+
+    <div id="probes-container"></div>
+
+    <section class="panel settings-panel" aria-labelledby="settings-heading">
+      <h2 id="settings-heading">Settings</h2>
+      <div id="settings-live-notice" class="notice" hidden>
+        Settings changes take effect on the <strong>next start</strong>, not the current stream —
+        except <strong>Max push speed</strong> and <strong>Catch-up multiplier</strong>, which apply
+        live within about a second (same dials as the Upload Speed panel).
+      </div>
+      <form id="settings-form">
+        <div class="form-field">
+          <label for="setting-RELAY_HOST">Relay host</label>
+          <input type="text" id="setting-RELAY_HOST" name="RELAY_HOST" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-RELAY_PORT">Relay port</label>
+          <input type="number" id="setting-RELAY_PORT" name="RELAY_PORT" min="1" max="65535" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-CATCH_UP_MULTIPLIER" title="Applies live within about a second — no pusher restart needed.">Catch-up multiplier</label>
+          <input type="number" id="setting-CATCH_UP_MULTIPLIER" name="CATCH_UP_MULTIPLIER" step="0.1" min="1" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-SEND_CEILING_BYTES_PER_SECOND" title="Absolute max push speed in Mbit/s. When above 0 it REPLACES the catch-up multiplier entirely (e.g. 16 = 16 Mbit/s). 0 = multiplier mode. Applies live within about a second — no pusher restart needed.">Max push speed (Mbit/s, 0 = use multiplier)</label>
+          <input type="number" id="setting-SEND_CEILING_BYTES_PER_SECOND" name="SEND_CEILING_BYTES_PER_SECOND" step="0.1" min="0" autocomplete="off">
+          <span id="send-ceiling-mbit-readout" class="control-helper">— Mbit/s</span>
+        </div>
+        <div class="form-field">
+          <label for="setting-RELAY_PROTOCOL" title="'tcp' (default) sends over a plain TCP connection to the relay, letting the kernel's own congestion control handle a slow link. 'srt' sends over SRT and requires the relay to listen in file mode, or the connection is rejected at handshake. Pusher restart required to apply.">Relay protocol (srt / tcp)</label>
+          <input type="text" id="setting-RELAY_PROTOCOL" name="RELAY_PROTOCOL" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-DASHBOARD_PORT">Dashboard port</label>
+          <input type="number" id="setting-DASHBOARD_PORT" name="DASHBOARD_PORT" min="1" max="65535" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-RECORDING_FOLDER_PATH">Recording folder path</label>
+          <input type="text" id="setting-RECORDING_FOLDER_PATH" name="RECORDING_FOLDER_PATH" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-RECORDING_FILENAME_GLOB">Recording filename glob</label>
+          <input type="text" id="setting-RECORDING_FILENAME_GLOB" name="RECORDING_FILENAME_GLOB" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-STREAM_ID">Stream ID</label>
+          <input type="text" id="setting-STREAM_ID" name="STREAM_ID" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-LATENCY_MICROSECONDS">Latency (microseconds)</label>
+          <input type="number" id="setting-LATENCY_MICROSECONDS" name="LATENCY_MICROSECONDS" min="0" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="setting-AUTO_PICKUP">Auto-pickup a new recording after a clean finish</label>
+          <select id="setting-AUTO_PICKUP" name="AUTO_PICKUP">
+            <option value="false">Off (detect + notify only, default)</option>
+            <option value="true">On (auto-start streaming)</option>
+          </select>
+        </div>
+        <div id="settings-error" class="form-error" role="alert" hidden></div>
+        <button id="btn-save-settings" type="submit" class="btn btn-save">Save Settings</button>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="cut-confirm" class="dialog-cut-confirm">
+    <p id="cut-confirm-message">—</p>
+    <div class="dialog-actions">
+      <button id="btn-cut-cancel" type="button" class="btn btn-secondary">Cancel</button>
+      <button id="btn-cut-confirm" type="button" class="btn btn-cut">Cut now, abandon backlog</button>
+    </div>
+  </dialog>
+
+  <dialog id="reset-confirm" class="dialog-cut-confirm">
+    <p id="reset-confirm-message">—</p>
+    <div class="dialog-actions">
+      <button id="btn-reset-cancel" type="button" class="btn btn-secondary">Cancel</button>
+      <button id="btn-reset-confirm" type="button" class="btn btn-reset-resume">Reset resume state</button>
+    </div>
+  </dialog>
+
+  <dialog id="delete-confirm" class="dialog-cut-confirm">
+    <p id="delete-confirm-message">—</p>
+    <div class="dialog-actions">
+      <button id="btn-delete-cancel" type="button" class="btn btn-secondary">Cancel</button>
+      <button id="btn-delete-confirm" type="button" class="btn btn-cut">Delete file</button>
+    </div>
+  </dialog>
+
+  <script src="format.js"></script>
+  <script src="app.js" defer></script>
+</body>
+</html>

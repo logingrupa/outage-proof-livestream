@@ -1,0 +1,31 @@
+# ffmpeg-srt-failure-stderr.txt
+# Captured by spike/Capture-FfmpegSrtFailureStderr.ps1 -- verbatim ffmpeg stderr tail
+# from a REAL mid-push SRT listener kill on this project's own ffmpeg build.
+# This is the authoritative ground truth for RES-04's NetworkDeath stderr patterns
+# (02-RESEARCH.md Assumption A2 / Open Question 1) -- NOT hand-authored guesses.
+#
+# Captured: 2026-07-14 16:14:44
+# ffmpeg version: ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers
+# Observed exit code: -5
+#
+# --- verbatim stderr tail below ---
+frame=  230 fps= 90 q=-1.0 size=     102KiB time=00:00:09.12 bitrate=  91.2kbits/s speed=3.55x    
+frame=  249 fps= 81 q=-1.0 size=     110KiB time=00:00:09.88 bitrate=  91.0kbits/s speed= 3.2x    
+frame=  260 fps= 72 q=-1.0 size=     118KiB time=00:00:10.32 bitrate=  93.4kbits/s speed=2.87x    
+frame=  282 fps= 68 q=-1.0 size=     127KiB time=00:00:11.20 bitrate=  93.1kbits/s speed=2.72x    
+frame=  304 fps= 66 q=-1.0 size=     136KiB time=00:00:12.08 bitrate=  92.5kbits/s speed=2.61x    
+frame=  321 fps= 62 q=-1.0 size=     144KiB time=00:00:12.76 bitrate=  92.3kbits/s speed=2.48x    
+frame=  343 fps= 61 q=-1.0 size=     153KiB time=00:00:13.64 bitrate=  91.8kbits/s speed=2.41x    
+frame=  365 fps= 59 q=-1.0 size=     162KiB time=00:00:14.52 bitrate=  91.5kbits/s speed=2.35x    
+frame=  386 fps= 58 q=-1.0 size=     171KiB time=00:00:15.36 bitrate=  91.2kbits/s speed=2.29x    
+frame=  404 fps= 56 q=-1.0 size=     179KiB time=00:00:16.08 bitrate=  91.1kbits/s speed=2.23x    
+[vost#0:0/copy @ 0000025646e427c0] Error submitting a packet to the muxer: I/O error
+    Last message repeated 1 times
+[out#0/mpegts @ 00000256466b4900] Error muxing a packet
+[out#0/mpegts @ 00000256466b4900] Task finished with error code: -5 (I/O error)
+[out#0/mpegts @ 00000256466b4900] Terminating thread with return code -5 (I/O error)
+[out#0/mpegts @ 00000256466b4900] Error writing trailer: I/O error
+[out#0/mpegts @ 00000256466b4900] Error closing file: I/O error
+frame=  417 fps= 54 q=-1.0 Lsize=     184KiB time=00:00:16.76 bitrate=  90.1kbits/s speed=2.18x    
+[out#0/mpegts @ 00000256466b4900] video:76KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 141.522181%
+Conversion failed!

@@ -1,0 +1,1109 @@
+/* Gapless SRT Pusher — Dashboard styles
+   Plain hand-written CSS. No preprocessor, no framework, no remote @import.
+   All design tokens live here as CSS custom properties (see 05-UI-SPEC.md). */
+
+:root {
+  /* Spacing scale (all multiples of 4px) */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px;
+
+  /* Color */
+  --color-bg: #0B0D12;
+  --color-surface: #161A22;
+  --color-border: #242A35;
+  --color-accent: #22C55E;
+  --color-destructive: #EF4444;
+  --color-amber: #F59E0B;
+  --color-blue: #3B82F6;
+  /* 260722-xbr/NIC-TELEMETRY-01: the hero chart's third (NIC upload) line/swatch --
+     a hue distinct from accent (send, green) / blue (record) / amber (delay). */
+  --color-purple: #A78BFA;
+  --color-muted: #8B93A7;
+  --color-text: #E5E7EB;
+
+  /* Fonts */
+  --font-ui: -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  /* Typography roles: size / weight / line-height */
+  --text-label-size: 13px;
+  --text-body-size: 16px;
+  --text-heading-size: 22px;
+  --text-display-size: 56px;
+  --weight-regular: 400;
+  --weight-semibold: 600;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--color-bg);
+}
+
+body {
+  margin: 0;
+  padding: var(--space-lg);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-body-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.5;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+/* ---------- Header bar ---------- */
+
+.header-bar {
+  /* DASH-04 (mobile-first sticky header): always visible while the operator
+     scrolls, with an opaque background and a z-index above the scrolling
+     <main> so content passes underneath it rather than showing through. */
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-md) 0 var(--space-lg) 0;
+  max-width: 960px;
+  margin: 0 auto;
+  background: var(--color-bg);
+}
+
+.header-title {
+  font-size: var(--text-heading-size);
+  font-weight: var(--weight-semibold);
+  line-height: 1.2;
+  color: var(--color-text);
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+/* Sticky header metrics strip (DASH-04): connection pill, delay, send/record
+   bitrate, and % sent -- everything the operator needs to see mid-service
+   without scrolling back up. Wraps to multiple lines on a narrow screen
+   rather than overflowing (single-column, mobile-first). */
+.header-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-md);
+  width: 100%;
+}
+
+/* Typography lives on the item, not the .header-metrics/.header-status
+   container (260719-fmu-03) -- .header-metric is reused standalone inside
+   .header-status (the "Behind live" readout next to the connection pill),
+   not only inside the .header-metrics strip, so it must carry its own
+   font-family/size/tabular-nums rather than relying on a container that
+   doesn't wrap it in both places. */
+.header-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-variant-numeric: tabular-nums;
+}
+
+.header-metric-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  color: var(--color-muted);
+}
+
+.header-metric-value {
+  color: var(--color-text);
+}
+
+@media (max-width: 640px) {
+  .header-bar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .header-metrics {
+    justify-content: space-between;
+    gap: var(--space-sm) var(--space-md);
+  }
+
+  .header-metrics .header-metric {
+    font-size: 12px;
+  }
+}
+
+/* ---------- Info affordance / hover tooltip (260719-fmu-03) ---------- */
+/* Small "(?)" badge next to a header-metric-label; pure-CSS hover/focus
+   reveal, no JS -- matches this file's existing no-framework discipline.
+   Keyboard-accessible via tabindex + :focus-within (Tab to it, tooltip
+   shows), touch-accessible via :hover on tap-and-hold on most mobile
+   browsers -- no dedicated touch handler added (kept simple per spec). */
+.info-affordance {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+
+.info-affordance:hover,
+.info-affordance:focus-visible {
+  color: var(--color-text);
+  border-color: var(--color-muted);
+}
+
+.info-affordance:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: 2px;
+}
+
+.info-tooltip {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(var(--space-xs));
+  width: 240px;
+  max-width: 60vw;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--space-xs);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: normal;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+  z-index: 20;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.info-affordance:hover .info-tooltip,
+.info-affordance:focus .info-tooltip,
+.info-affordance:focus-within .info-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ---------- Status pill ---------- */
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  color: var(--color-muted);
+}
+
+.state-idle {
+  color: var(--color-muted);
+}
+
+.state-streaming {
+  color: var(--color-accent);
+}
+
+.state-reconnecting {
+  color: var(--color-amber);
+}
+
+.state-draining {
+  color: var(--color-blue);
+}
+
+.state-unknown {
+  color: var(--color-muted);
+}
+
+/* Finished (260718-epo): calm and reassuring -- deliberately NOT the green
+   Streaming color (this is not "still live") and NOT a destructive red (this is
+   not a failure) -- reuses the existing informational blue token instead. */
+.state-finished {
+  color: var(--color-blue);
+}
+
+/* Recording-status badge modifiers (05.1) -- reuse .status-pill, no new colors:
+   Growing reuses Accent green (same "healthy, actively producing" signal as
+   Streaming); Static/Live both reuse the existing neutral gray. */
+.state-growing {
+  color: var(--color-accent);
+}
+
+.state-static {
+  color: var(--color-muted);
+}
+
+/* ---------- VPS health pill (D-12, 15-06) ---------- */
+/* Native <details>/<summary> for click-persistence + reuse of the existing
+   .info-tooltip opacity/visibility/transition pattern for the hover half --
+   ZERO new JS event-handling code. Every value below references an existing
+   custom property; no new color, font size, or breakpoint is introduced. */
+
+.vps-health-details {
+  position: relative;
+}
+
+/* Remove default <summary> marker/triangle -- this must look like a plain
+   .header-metric + .status-pill pair, not a native disclosure widget. */
+.vps-health-summary {
+  cursor: pointer;
+  list-style: none;
+}
+.vps-health-summary::-webkit-details-marker {
+  display: none;
+}
+
+.vps-health-detail {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: var(--space-xs);
+  width: 200px;
+  padding: var(--space-md);
+  border-radius: var(--space-xs);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+/* Hover/focus preview (D-12 "hover" half) even before the <details> is
+   clicked open -- identical mechanism to .info-affordance/.info-tooltip. */
+.vps-health-details:not([open]) .vps-health-detail {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.vps-health-details:not([open]):hover .vps-health-detail,
+.vps-health-details:not([open]):focus-within .vps-health-detail {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Click-open (D-12 "click" half, native <details open> attribute) always
+   shows the panel regardless of hover state. */
+.vps-health-details[open] .vps-health-detail {
+  opacity: 1;
+  visibility: visible;
+}
+
+.vps-health-check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.vps-health-check-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.vps-health-check-label {
+  font-family: var(--font-ui);
+  font-size: var(--text-label-size);
+  color: var(--color-text);
+  flex: 1;
+}
+
+.vps-health-check-detail {
+  margin: 0;
+  max-width: none;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- Banners / notices ---------- */
+
+.banner {
+  max-width: 960px;
+  margin: 0 auto var(--space-lg) auto;
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--space-xs);
+  font-size: var(--text-body-size);
+  line-height: 1.5;
+}
+
+.banner-stale {
+  background: var(--color-surface);
+  border: 1px solid var(--color-amber);
+  color: var(--color-text);
+}
+
+.notice {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--space-xs);
+  padding: var(--space-md);
+  margin-bottom: var(--space-md);
+  font-size: var(--text-body-size);
+  color: var(--color-text);
+}
+
+/* ---------- Panels ---------- */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--space-xs);
+  padding: var(--space-lg);
+}
+
+.panel h2 {
+  font-size: var(--text-heading-size);
+  font-weight: var(--weight-semibold);
+  line-height: 1.2;
+  margin-bottom: var(--space-md);
+}
+
+/* ---------- Session finished (260718-epo) ---------- */
+
+.session-finished-panel {
+  text-align: center;
+}
+
+.session-finished-summary {
+  font-size: var(--text-body-size);
+  color: var(--color-text);
+  margin: 0 0 var(--space-sm) 0;
+}
+
+.session-finished-detail {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  color: var(--color-muted);
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+
+.notice-pickup {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+  margin-bottom: 0;
+}
+
+/* ---------- Empty state ---------- */
+
+.empty-state {
+  text-align: center;
+}
+
+.empty-state h2 {
+  font-size: var(--text-heading-size);
+  font-weight: var(--weight-semibold);
+}
+
+.empty-state p {
+  color: var(--color-muted);
+  font-size: var(--text-body-size);
+  margin: 0;
+}
+
+/* ---------- Hero (delay-behind-live) ---------- */
+
+.hero-panel {
+  padding-top: var(--space-2xl);
+  padding-bottom: var(--space-2xl);
+  text-align: center;
+}
+
+.hero {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: var(--space-xs);
+}
+
+/* Display role: reserved for exactly this one element. 56px / 600 / 1.0,
+   mono + tabular-nums so a 1-digit to 5-digit swing (observed: up to 7,689s
+   during the phase-4 outage test) never reflows the page. */
+#delay-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-display-size);
+  font-weight: var(--weight-semibold);
+  line-height: 1.0;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+  min-width: 7ch; /* sized for at least "88888.8" */
+  text-align: right;
+  white-space: nowrap;
+}
+
+#delay-value.state-streaming {
+  color: var(--color-accent);
+}
+
+#delay-value.state-reconnecting {
+  color: var(--color-amber);
+}
+
+#delay-value.state-unknown {
+  color: var(--color-muted);
+}
+
+.hero-unit {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  color: var(--color-muted);
+}
+
+.hero-caption {
+  margin: var(--space-sm) 0 0 0;
+  color: var(--color-muted);
+  font-size: var(--text-label-size);
+  font-family: var(--font-mono);
+  line-height: 1.4;
+}
+
+/* 1-minute delay trend (260719-fmu-04, alignment fixed in fmu-06): "caught up
+   18s in last minute" / "fell behind 12s in last minute" / "holding steady" /
+   "measuring…" -- mirrors .hero-caption's own typography exactly (color,
+   font-size, font-family, line-height; no tabular-nums -- the caption
+   doesn't use it either, and this text is prose, not a numeric column).
+   text-align/max-width/auto side-margins are explicit rather than relying on
+   inherited .hero-panel centering alone: the trend sentence ("caught up 1m
+   30s in last minute") is meaningfully longer than the short caption and can
+   wrap on a narrow/mobile viewport (this dashboard is mobile-first) --
+   max-width + margin:auto keeps a wrapped 2-line trend reading as a tidy
+   centered block instead of spanning edge-to-edge, mirroring the same
+   max-width-for-readability convention .control-helper already uses. */
+.hero-trend {
+  margin: var(--space-xs) auto 0 auto;
+  max-width: 32ch;
+  color: var(--color-muted);
+  font-size: var(--text-label-size);
+  font-family: var(--font-mono);
+  line-height: 1.4;
+  text-align: center;
+}
+
+.hero-trend-positive {
+  color: var(--color-accent);
+}
+
+.hero-trend-warning {
+  color: var(--color-amber);
+}
+
+.hero-trend-neutral,
+.hero-trend-measuring {
+  color: var(--color-muted);
+}
+
+/* ---------- Hero mini-chart (260719-fmu-07) ----------
+   Hand-rolled inline SVG, no charting library. Two stacked panels sharing
+   ONE time axis: top (taller, send+record bitrate, Mbit/s scale), bottom
+   (slim, ~1/3 height, delay-behind-live, seconds scale) -- bitrate and
+   seconds NEVER share a y-scale (dataviz method hard rule). Colors reuse
+   the SAME state-* palette tokens already used elsewhere on this exact
+   dashboard (proven to read against this theme): send=accent (healthy),
+   record=blue (neutral), delay=amber (muted warning hue) -- three
+   distinguishable hues, not a red/green-only distinction, and every line
+   also carries a direct text label so color is never the sole identifier. */
+
+.hero-chart {
+  margin-top: var(--space-md);
+}
+
+.hero-chart-placeholder {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: var(--text-label-size);
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+.hero-chart-body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hero-chart-window-caption {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.hero-chart-window-caption span {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--color-muted);
+}
+
+.hero-chart-svg {
+  width: 100%;
+  display: block;
+}
+
+.hero-chart-svg-top {
+  height: 90px;
+}
+
+.hero-chart-svg-bottom {
+  height: 30px;
+}
+
+/* Recessive grid: at most 2-3 muted horizontal lines per panel, no vertical
+   grid at all. vector-effect keeps a 1px stroke crisp even though the SVG
+   itself stretches non-uniformly to fill a responsive width. */
+.hero-chart-gridline {
+  stroke: var(--color-border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.hero-chart-axis-label {
+  fill: var(--color-muted);
+  font-size: 9px;
+  font-family: var(--font-mono);
+}
+
+.hero-chart-line {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.hero-chart-line-send {
+  stroke: var(--color-accent);
+}
+
+.hero-chart-line-record {
+  stroke: var(--color-blue);
+}
+
+.hero-chart-line-delay {
+  stroke: var(--color-amber);
+  stroke-width: 1.5;
+}
+
+.hero-chart-line-nic {
+  stroke: var(--color-purple);
+}
+
+/* Direct end labels (dataviz method: no legend, label the line itself) --
+   the swatch carries color identity, the text stays plain --color-text
+   (never colored text). 8px diameter swatch (r=4). */
+.hero-chart-swatch-send {
+  fill: var(--color-accent);
+}
+
+.hero-chart-swatch-record {
+  fill: var(--color-blue);
+}
+
+.hero-chart-swatch-nic {
+  fill: var(--color-purple);
+}
+
+.hero-chart-end-label {
+  fill: var(--color-text);
+  font-size: 10px;
+  font-family: var(--font-ui);
+}
+
+.hero-chart-crosshair {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-muted);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.hero-chart-tooltip {
+  position: absolute;
+  top: 0;
+  min-width: 130px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.hero-chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  justify-content: space-between;
+}
+
+.hero-chart-tooltip-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.hero-chart-tooltip-swatch.hero-chart-swatch-send {
+  background: var(--color-accent);
+}
+
+.hero-chart-tooltip-swatch.hero-chart-swatch-record {
+  background: var(--color-blue);
+}
+
+.hero-chart-tooltip-swatch.hero-chart-swatch-nic {
+  background: var(--color-purple);
+}
+
+.hero-chart-tooltip-swatch.hero-chart-swatch-delay {
+  background: var(--color-amber);
+}
+
+.hero-chart-tooltip-label {
+  color: var(--color-muted);
+}
+
+.hero-chart-tooltip-value {
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Recording status (05.1) ---------- */
+
+.recording-status-panel {
+  padding-top: var(--space-md);
+  padding-bottom: var(--space-md);
+}
+
+.recording-status-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin: 0;
+}
+
+.recording-status-label {
+  color: var(--color-muted);
+  font-size: var(--text-body-size);
+}
+
+.recording-status-file {
+  font-size: var(--text-body-size);
+  color: var(--color-text);
+}
+
+/* ---------- Controls ---------- */
+
+.controls-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.control-helper {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: var(--text-label-size);
+  font-family: var(--font-mono);
+  line-height: 1.4;
+  max-width: 32ch;
+}
+
+.btn {
+  min-width: 44px;
+  min-height: 44px;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--space-xs);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-body-size);
+  font-weight: var(--weight-semibold);
+  line-height: 1.5;
+  cursor: pointer;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: 2px;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-start {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-bg);
+}
+
+.btn-stop {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.btn-cut {
+  background: var(--color-destructive);
+  border-color: var(--color-destructive);
+  color: var(--color-text);
+}
+
+.btn-secondary {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+/* Reset Resume State (05.1) -- amber OUTLINE, not filled, reusing the
+   existing --color-amber (already declared for the Reconnecting status
+   pill). Distinct in severity from Cut Now/Delete (filled destructive red):
+   resetting the offset does not destroy any file. */
+.btn-reset-resume {
+  background: var(--color-surface);
+  border-color: var(--color-amber);
+  color: var(--color-amber);
+}
+
+.btn-save {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-bg);
+}
+
+.btn-notifications {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text);
+  min-width: auto;
+  min-height: auto;
+  padding: var(--space-xs) var(--space-sm);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+}
+
+/* ---------- Metrics ---------- */
+
+/* 15-03 Task 3 (D-11): the flat 10-row Metrics panel split into three
+   captioned topic groups (Flow / Position / Connection). .metrics-grid is
+   reused UNMODIFIED, now scoped per-group instead of once for the whole
+   panel -- a pure wrapping change, no new breakpoint, no new grid rule. */
+.metrics-group {
+  margin-bottom: var(--space-lg);
+}
+
+.metrics-group:last-child {
+  margin-bottom: 0;
+}
+
+.metrics-group-caption {
+  margin: 0 0 var(--space-sm) 0;
+  color: var(--color-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-semibold);
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-sm) var(--space-lg);
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: var(--space-sm) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.metric-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  color: var(--color-muted);
+}
+
+.metric-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+  text-align: right;
+}
+
+@media (max-width: 640px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------- Timeline ---------- */
+
+.timeline-track {
+  position: relative;
+  width: 100%;
+  height: var(--space-md);
+  background: var(--color-border);
+  border-radius: var(--space-xs);
+  overflow: hidden;
+}
+
+.timeline-sent {
+  height: 100%;
+  width: 0%;
+  background: var(--color-accent);
+}
+
+.timeline-labels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--space-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  color: var(--color-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-stats {
+  display: flex;
+  gap: var(--space-lg);
+  margin-top: var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Recording management (05.1) ---------- */
+
+.recording-management-subsection {
+  margin-bottom: var(--space-lg);
+}
+
+.recording-management-subsection:last-child {
+  margin-bottom: 0;
+}
+
+.resume-state-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-xs);
+}
+
+.recordings-heading {
+  font-size: var(--text-body-size);
+  font-weight: var(--weight-semibold);
+  margin: 0 0 var(--space-sm) 0;
+  color: var(--color-text);
+}
+
+.recordings-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.recording-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.recording-row:last-child {
+  border-bottom: none;
+}
+
+.recording-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.recording-row-name {
+  font-size: var(--text-body-size);
+  color: var(--color-text);
+}
+
+.recording-row-meta {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+  color: var(--color-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.recordings-empty {
+  color: var(--color-muted);
+  font-size: var(--text-body-size);
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .recording-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+/* ---------- Settings ---------- */
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-md);
+}
+
+.form-field label {
+  font-size: var(--text-body-size);
+  font-weight: var(--weight-regular);
+  color: var(--color-text);
+}
+
+.form-field input {
+  padding: var(--space-sm) var(--space-md);
+  min-height: 44px;
+  border-radius: var(--space-xs);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: var(--text-body-size);
+}
+
+.form-field input:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: 2px;
+}
+
+.form-error {
+  color: var(--color-destructive);
+  font-size: var(--text-body-size);
+  margin-bottom: var(--space-md);
+}
+
+/* ---------- Cut confirmation dialog ---------- */
+
+.dialog-cut-confirm {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--space-xs);
+  padding: var(--space-lg);
+  max-width: 480px;
+}
+
+.dialog-cut-confirm::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.dialog-cut-confirm p {
+  margin: 0 0 var(--space-lg) 0;
+  font-size: var(--text-body-size);
+  line-height: 1.5;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-md);
+}
+
+/* ---------- Reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

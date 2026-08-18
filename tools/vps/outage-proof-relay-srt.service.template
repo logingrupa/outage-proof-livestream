@@ -1,0 +1,41 @@
+[Unit]
+# Generic SRT relay listener for outage-proof-livestream (advanced transport).
+# pusher.ps1 (RELAY_PROTOCOL=srt) --SRT caller--> this VPS, port __RELAY_PORT__
+#   --> this ffmpeg listener --c copy--> one YouTube Enhanced-RTMP ingest.
+# Requires a libsrt-enabled ffmpeg on BOTH ends (setup-vps.sh probes for it before
+# installing this unit). SRT rides UDP, so it needs its own loss-recovery tuning --
+# see the latency/rcvbuf/lossmaxttl notes below.
+# Pure userspace: binds 0.0.0.0:__RELAY_PORT__, pushes outbound. No tunnel, no bonded
+# WAN, no router product assumed -- this listener works standalone over the open
+# internet, same as the tcp variant.
+Description=outage-proof-livestream SRT relay (SRT -> YouTube)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# YT_URL secret lives in the env file this installer creates (chmod 600, never
+# populated by the installer itself -- the operator supplies it out of band).
+EnvironmentFile=/etc/default/outage-proof-relay
+# transtype=file is MANDATORY here, not a preference: the gapless pusher connects
+# in SRT file mode (STREAM API) so the disk buffer / catch-up can send late data.
+# transtype=live DISCARDS late data and REJECTS a file-mode caller at handshake
+# (REJECT 1012 MessageAPI/StreamAPI collision) -> endless reconnect storm. Pusher
+# and this listener must both stay file-mode together.
+# latency/rcvlatency are in MICROSECONDS (8000000 = 8s) -- generous headroom for an
+# ordinary internet path's jitter. rcvbuf/ffs sized to hold latency x bitrate in
+# packets so a burst does not overflow the receive window ("No room to store"
+# drops -> corrupt frames). lossmaxttl widens SRT's reorder tolerance so packets
+# that arrive slightly out of order are not treated as loss and re-requested
+# unnecessarily.
+ExecStart=/usr/bin/ffmpeg -hide_banner -loglevel warning \
+  -mode listener -listen_timeout -1 \
+  -err_detect ignore_err -probesize 10M -analyzeduration 5000000 \
+  -i "srt://0.0.0.0:__RELAY_PORT__?mode=listener&transtype=file&latency=8000000&rcvlatency=8000000&rcvbuf=67108864&ffs=67108864&recv_buffer_size=33554432&lossmaxttl=4096" \
+  -map 0 -c copy -f flv "${YT_URL}"
+Restart=always
+RestartSec=2
+# Caller disconnect -> EOF -> exit -> systemd respawns -> re-listens for the next connect.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+[Unit]
+# Generic TCP relay listener for outage-proof-livestream.
+# pusher.ps1 (RELAY_PROTOCOL=tcp) --raw mpegts over plain TCP--> this VPS, port __RELAY_PORT__
+#   --> this ffmpeg listener --c copy--> one YouTube Enhanced-RTMP ingest.
+# Plain TCP: the kernel's own congestion control paces the send, so no libsrt build is
+# required on either end. Works through NAT with a single forwarded/open port.
+# Pure userspace: binds 0.0.0.0:__RELAY_PORT__, pushes outbound. No tunnel, no bonded WAN,
+# no router product assumed -- this is the generic public installer's default transport.
+Description=outage-proof-livestream TCP relay (raw mpegts over TCP -> YouTube)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# YT_URL secret lives in the env file this installer creates (chmod 600, never
+# populated by the installer itself -- the operator supplies it out of band).
+EnvironmentFile=/etc/default/outage-proof-relay
+# listen_timeout=-1: wait for a caller forever. recv_buffer_size: a generous kernel
+# socket buffer so a burst of catch-up data is absorbed without drops.
+ExecStart=/usr/bin/ffmpeg -hide_banner -loglevel warning \
+  -err_detect ignore_err -probesize 10M -analyzeduration 5000000 \
+  -i "tcp://0.0.0.0:__RELAY_PORT__?listen=1&listen_timeout=-1&recv_buffer_size=33554432" \
+  -map 0 -c copy -f flv "${YT_URL}"
+Restart=always
+RestartSec=2
+# Client disconnect -> EOF -> exit -> systemd respawns -> re-listens for the next connect.
+
+[Install]
+WantedBy=multi-user.target
