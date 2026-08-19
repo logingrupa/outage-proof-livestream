@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      No-flash theme script (D-11). Must run before ANY stylesheet and before
+      the module script -- not deferred, not async, not external. Vite leaves
+      inline script bodies alone (it only rewrites `src` references), and
+      appends the built module script + stylesheet link at the END of this
+      `<head>`, after everything already here -- so this script staying first
+      in source order is what keeps it first in the built output too.
+    -->
+    <script id="theme-init">
+      (function () {
+        var stored = localStorage.getItem('theme');
+        var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        var isDark = stored === 'dark' || (stored !== 'light' && prefersDark);
+        document.documentElement.classList.toggle('dark', isDark);
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="256x256" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Outage-Proof Livestream — Keep your church livestream on air</title>
+    <meta name="description" content="A free, open-source Windows service that makes church livestreams outage-proof. OBS records to disk; a pusher resumes from the exact byte and catches up faster than realtime. Zero content lost." />
+    <!--
+      robots.txt is INERT on this project-subpath Pages deployment (D-07) --
+      crawlers only read robots.txt at the origin root, which this repo does
+      not control. This meta tag is the directive that actually applies here.
+    -->
+    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large" />
+    <link rel="canonical" href="https://logingrupa.github.io/outage-proof-livestream/" />
+
+    <meta property="og:title" content="Outage-Proof Livestream — Keep your church livestream on air" />
+    <meta property="og:description" content="A free, open-source Windows service that makes church livestreams outage-proof. OBS records to disk; a pusher resumes from the exact byte and catches up faster than realtime. Zero content lost." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://logingrupa.github.io/outage-proof-livestream/" />
+    <meta property="og:site_name" content="Outage-Proof Livestream" />
+    <meta property="og:image" content="https://logingrupa.github.io/outage-proof-livestream/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://logingrupa.github.io/outage-proof-livestream/og.png" />
+
+    <!--GSD_STRUCTURED_DATA_PLACEHOLDER: replaced by scripts/prerender.mjs with
+        the <script type="application/ld+json"> tags rendered server-side
+        (D-20). Deliberately inert on the Vite dev server, which never runs
+        prerender -- JSON-LD is static build-time data, so seeing none while
+        running `npm run dev` is expected, not a bug.-->
+
+    <!--
+      No `suppressHydrationWarning` here on purpose. React only hydrates the
+      `#root` element below; `<html>` sits outside the hydrated tree and can
+      never mismatch, so the attribute would be meaningless raw HTML on an
+      element React never touches. The real requirement -- no theme-dependent
+      MARKUP rendered during prerender -- is enforced in the components
+      themselves (see ThemeToggle / useMounted).
+    -->
+  </head>
+  <body>
+    <!--
+     ██╗  ██╗██╗███╗   ██╗ ██████╗     ██████╗ ███████╗
+     ██║ ██╔╝██║████╗  ██║██╔════╝    ██╔═══██╗██╔════╝
+     █████╔╝ ██║██╔██╗ ██║██║  ███╗   ██║   ██║█████╗
+     ██╔═██╗ ██║██║╚██╗██║██║   ██║   ██║   ██║██╔══╝
+     ██║  ██╗██║██║ ╚████║╚██████╔╝   ╚██████╔╝██║
+     ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝     ╚═════╝ ╚═╝
+
+     ██╗  ██╗██╗███╗   ██╗ ██████╗ ███████╗
+     ██║ ██╔╝██║████╗  ██║██╔════╝ ██╔════╝
+     █████╔╝ ██║██╔██╗ ██║██║  ███╗███████╗
+     ██╔═██╗ ██║██║╚██╗██║██║   ██║╚════██║
+     ██║  ██╗██║██║ ╚████║╚██████╔╝███████║
+     ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝
+
+
+          JESUS CHRIST OF NAZARETH IS KING OF KINGS
+
+
+     "On his robe and on his thigh he has this name written:
+      KING OF KINGS AND LORD OF LORDS."
+                                             Revelation 19:16
+
+     This service is free because what we were given was free.
+                                                Matthew 10:8
+
+     Spirit and Truth city church, Lielvārde      satchurch.lv
+     LOGINGRUPA Ltd.                             logingrupa.lv
+
+     Now read the rest of the source. No trackers, no cookies, nothing phones home.
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/entry-client.tsx"></script>
+  </body>
+</html>

@@ -1,4 +1,4 @@
-// Gapless SRT Pusher — Dashboard client
+// Outage-Proof Livestream — Dashboard client
 // Plain browser JavaScript. No imports, no bundler, no framework, no CDN.
 // Binds against the frozen element-id contract from 05-08 and the view-model
 // shape from 05-05/05-07 (Get-DashboardViewModel / GET /api/stats).

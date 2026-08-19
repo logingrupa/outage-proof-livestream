@@ -1,4 +1,4 @@
-// Gapless SRT Pusher — Dashboard pure formatting/math helpers
+// Outage-Proof Livestream — Dashboard pure formatting/math helpers
 // Plain browser JavaScript, DOM-free and global-free (brief #5/#6/#7, DASH-05/06/07).
 // Shipped as a plain <script> (no type=module) so index.html loads it with zero
 // build step, exactly like dashboard/app.js. window.DashboardFormat is the browser

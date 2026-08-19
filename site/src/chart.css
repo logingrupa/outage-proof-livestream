@@ -1,0 +1,13 @@
+/* ServiceRecoveryChart: the delay curve draws itself left to right. The path
+   carries pathLength="1" and stroke-dasharray="1", so one dash spans the whole
+   curve regardless of its real length. With motion reduced, the animation is
+   neutralised by the global rule below and the fully drawn line (dashoffset 0)
+   is what remains -- the content never depends on the animation running. */
+@keyframes chart-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}

@@ -1,0 +1,28 @@
+# Outage-Proof Livestream
+
+> A free, open-source Windows service that makes church livestreams
+> outage-proof. OBS records the service to a local file on disk and never
+> touches the network; a small pusher service tails that growing file and
+> pushes it to a relay VPS, which fans it out to YouTube. Any network,
+> router, or relay outage means zero content loss -- the disk file is the
+> buffer, and the pusher resumes from the exact byte offset it left off at,
+> catching up faster than realtime so the stream stays gap-free.
+
+Licensed under the AGPL-3.0. Built by church members of LOGINGRUPA Ltd. at
+Spirit and Truth city church, Lielvarde, Latvia.
+
+## Source
+
+- [GitHub repository](https://github.com/logingrupa/outage-proof-livestream): full source, issues, and releases
+- [README](https://github.com/logingrupa/outage-proof-livestream/blob/main/README.md): architecture, requirements, and both quickstarts, in plain Markdown
+- [LICENSE](https://github.com/logingrupa/outage-proof-livestream/blob/main/LICENSE): AGPL-3.0 licence text
+
+## Page sections
+
+- [The problem](https://logingrupa.github.io/outage-proof-livestream/#problem): why a dropped connection normally means lost stream content
+- [How it works](https://logingrupa.github.io/outage-proof-livestream/#how-it-works): the disk-file-as-buffer architecture and byte-offset resume
+- [Quickstart](https://logingrupa.github.io/outage-proof-livestream/#quickstart): install steps for the church PC and the relay VPS
+- [Transport choice](https://logingrupa.github.io/outage-proof-livestream/#transport): tcp (default) vs srt (advanced), and why
+- [Requirements](https://logingrupa.github.io/outage-proof-livestream/#requirements): what the church PC and the relay VPS each need
+- [FAQ](https://logingrupa.github.io/outage-proof-livestream/#faq): common volunteer questions, answered
+- [Mission](https://logingrupa.github.io/outage-proof-livestream/#mission): why this project exists and who built it

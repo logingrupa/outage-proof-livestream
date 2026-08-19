@@ -1,0 +1,35 @@
+/* RevealOnScroll (Task 3): a short fade with a few pixels of upward travel.
+   Applied via classList by RevealOnScroll.tsx AFTER mount only -- the
+   prerendered/first-paint markup never carries `.reveal-pending`. */
+@keyframes reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.reveal-pending {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.reveal-in {
+  animation: reveal-in 0.5s ease-out forwards;
+}
+
+/* Second line of defence (first is the site-wide rule in index.css):
+   neutralises the reveal specifically, in case JS applies these classes
+   before this stylesheet's media query is otherwise honoured. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal-pending {
+    opacity: 1;
+    transform: none;
+  }
+  .reveal-in {
+    animation: none;
+  }
+}

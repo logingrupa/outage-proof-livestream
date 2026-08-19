@@ -1,0 +1,45 @@
+# This file is INERT on this deployment (D-07). GitHub Pages serves this
+# repo at a project SUBPATH (https://logingrupa.github.io/outage-proof-livestream/),
+# but crawlers only read robots.txt at the ORIGIN ROOT
+# (https://logingrupa.github.io/robots.txt), which belongs to the
+# `logingrupa` user site and is not controllable from this repository. The
+# directive that actually applies to this page is the <meta name="robots">
+# tag in index.html. This file ships anyway, for self-documentation.
+#
+# Allow everything -- the code is AGPL-3.0 and already public; being found
+# by people and AI agents is the entire point.
+
+User-agent: *
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: OAI-AdsBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-User
+Allow: /
+
+User-agent: Claude-SearchBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: https://logingrupa.github.io/outage-proof-livestream/sitemap.xml

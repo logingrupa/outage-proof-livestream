@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="A continuous line, bridged over a gap">
+  <!--
+    Original mark (X5Q-03, no stock glyph): a continuous horizontal line with
+    a notch -- the outage -- visibly bridged by an arc. A favicon has no
+    inheriting `currentColor` context, so this uses a prefers-color-scheme
+    media query instead: near-black on a light browser chrome, near-white on
+    a dark one -- matching --foreground in both site themes (src/index.css).
+    Regenerate the PNG fallback with:
+      node scripts/renderFaviconPng.mjs
+  -->
+  <style>
+    path { stroke: #171717; }
+    @media (prefers-color-scheme: dark) {
+      path { stroke: #fafafa; }
+    }
+  </style>
+  <path d="M4 16 H12" fill="none" stroke-width="3.2" stroke-linecap="round" />
+  <path d="M20 16 H28" fill="none" stroke-width="3.2" stroke-linecap="round" />
+  <path d="M12 16 Q16 5 20 16" fill="none" stroke-width="3.2" stroke-linecap="round" />
+</svg>
