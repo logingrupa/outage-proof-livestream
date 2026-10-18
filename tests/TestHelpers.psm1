@@ -28,7 +28,8 @@
 #          Start-SrtListener, Stop-SrtListener, Test-ByteRangeEquality,
 #          Invoke-FfmpegSrtFailureCapture, New-TestTunedPusherCopy,
 #          Start-ValidMpegtsGrowthWriter, Stop-ValidMpegtsGrowthWriter,
-#          Start-SecondValidMpegtsRecording
+#          Start-SecondValidMpegtsRecording, New-StdinStallStandinFfmpeg,
+#          New-FakePusherProcess
 
 Set-StrictMode -Version Latest
 
@@ -826,7 +827,14 @@ function New-TestTunedPusherCopy {
         # A scratch path that DOES NOT EXIST is the correct default -- Read-LiveTunableOverrides'
         # own contract already treats a missing file as "no override signal" (both
         # properties $null), which safely keeps the tuned copy's pinned values.
-        [string] $EnvFilePath = (Join-Path ([System.IO.Path]::GetTempPath()) ("pusher-test-env-{0}.env" -f ([Guid]::NewGuid())))
+        [string] $EnvFilePath = (Join-Path ([System.IO.Path]::GetTempPath()) ("pusher-test-env-{0}.env" -f ([Guid]::NewGuid()))),
+        # Fifth instance of the leak class: pusher.ps1 names its per-install Pusher mutex
+        # from $pusherSingleInstanceScopeRoot (default: its own directory). The tuned copy
+        # lives in the repo root, so an unrewritten scope would take the PRODUCTION Pusher
+        # mutex whenever the suite runs from the live install, and the live supervisor's
+        # orphan probe would then refuse to launch its pusher. Always rewritten to a unique
+        # path that never needs to exist (the mutex name is only a hash of it).
+        [string] $SingleInstanceScopeRoot = (Join-Path ([System.IO.Path]::GetTempPath()) ("pusher-test-scope-{0}" -f ([Guid]::NewGuid())))
     )
 
     $repoRootPathForCopy = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -937,6 +945,8 @@ function New-TestTunedPusherCopy {
     $pusherSource = Set-TunedPusherVariable -Source $pusherSource -VariableName 'controlFilePath' -ValueLiteral "'$ControlFilePath'"
     # ALWAYS rewritten, never opt-in -- see -EnvFilePath's own parameter comment above.
     $pusherSource = Set-TunedPusherVariable -Source $pusherSource -VariableName 'envPath' -ValueLiteral "'$EnvFilePath'"
+    # ALWAYS rewritten, never opt-in -- see -SingleInstanceScopeRoot's own parameter comment above.
+    $pusherSource = Set-TunedPusherVariable -Source $pusherSource -VariableName 'pusherSingleInstanceScopeRoot' -ValueLiteral "'$SingleInstanceScopeRoot'"
 
     $testPusherPath = Join-Path $repoRootPathForCopy (".pusher.integrationtest.{0}.ps1" -f ([Guid]::NewGuid()))
     Set-Content -LiteralPath $testPusherPath -Value $pusherSource -Encoding utf8
@@ -1218,4 +1228,57 @@ try {
     }
 }
 
-Export-ModuleMember -Function New-SampleMpegtsFile, Start-SyntheticMpegtsWriter, Stop-SyntheticMpegtsWriter, Start-SrtListener, Stop-SrtListener, Read-FileByteRange, Get-ByteRangeComparison, Test-ByteRangeEquality, Test-DeliveredPrefixIntact, Invoke-FfmpegSrtFailureCapture, New-TestTunedPusherCopy, Start-ValidMpegtsGrowthWriter, Stop-ValidMpegtsGrowthWriter, Start-SecondValidMpegtsRecording, New-StdinStallStandinFfmpeg
+function New-FakePusherProcess {
+    <#
+    .SYNOPSIS
+    A duck-typed stand-in for the System.Diagnostics.Process that
+    Start-PusherProcess (supervisor.ps1) returns, so Invoke-Supervisor tests can
+    mock the spawn and still run the REAL Wait-PusherProcessExit loop (261018).
+
+    .DESCRIPTION
+    Exposes only what Wait-PusherProcessExit touches: WaitForExit (timed and
+    parameterless), ExitCode and Dispose. Kill exists purely so a test can assert
+    it was NEVER called. AlivePollCount is how many timed waits report "still
+    running" before the fake exits. MaximumTimedWaitCount turns a wait loop that
+    never ends into a failing test instead of a hung Pester run.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [int] $ExitCode,
+        [int] $AlivePollCount = 0,
+        [int] $MaximumTimedWaitCount = 10000
+    )
+
+    $fakePusherProcess = [pscustomobject]@{
+        ExitCode                      = $ExitCode
+        RemainingAlivePollCount       = $AlivePollCount
+        MaximumTimedWaitCount         = $MaximumTimedWaitCount
+        TimedWaitTimeoutsMilliseconds = [System.Collections.Generic.List[int]]::new()
+        HasExited                     = $false
+        FinalWaitCount                = 0
+        DisposeCount                  = 0
+        KillCount                     = 0
+    }
+    $fakePusherProcess | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        if ($args.Count -eq 0) {
+            $this.FinalWaitCount++
+            return
+        }
+        if ($this.TimedWaitTimeoutsMilliseconds.Count -ge $this.MaximumTimedWaitCount) {
+            throw 'fake pusher polled too many times -- the wait loop never ended'
+        }
+        $this.TimedWaitTimeoutsMilliseconds.Add([int] $args[0])
+        if ($this.RemainingAlivePollCount -gt 0) {
+            $this.RemainingAlivePollCount--
+            return $false
+        }
+        $this.HasExited = $true
+        return $true
+    }
+    $fakePusherProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.DisposeCount++ }
+    $fakePusherProcess | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.KillCount++ }
+    return $fakePusherProcess
+}
+
+Export-ModuleMember -Function New-SampleMpegtsFile, Start-SyntheticMpegtsWriter, Stop-SyntheticMpegtsWriter, Start-SrtListener, Stop-SrtListener, Read-FileByteRange, Get-ByteRangeComparison, Test-ByteRangeEquality, Test-DeliveredPrefixIntact, Invoke-FfmpegSrtFailureCapture, New-TestTunedPusherCopy, Start-ValidMpegtsGrowthWriter, Stop-ValidMpegtsGrowthWriter, Start-SecondValidMpegtsRecording, New-StdinStallStandinFfmpeg, New-FakePusherProcess

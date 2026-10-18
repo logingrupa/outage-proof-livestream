@@ -2,21 +2,30 @@
 .SYNOPSIS
 Idempotent, elevation-aware installer for the Gapless SRT Pusher (SVC-01, SVC-02).
 
-Verifies prerequisites (elevation, PowerShell 7, ffmpeg with libsrt support), copies
-`.env.example` -> `.env` on first run only (never overwrites an operator-edited
-`.env`), and registers a single `-AtStartup` Windows Scheduled Task
-('GaplessSrtPusher') that launches supervisor.ps1 -- which comes up IDLE and streams
-nothing until an operator explicitly starts it, and which owns crash restart (the
-task settings do NOT restart the action on a non-zero exit; see
-Register-PusherScheduledTask). All Session-0
-hardening (PITFALLS.md Pitfall 10) is baked in: an absolute `pwsh.exe` path,
-explicit `-ExecutionPolicy Bypass -NoProfile`, and an explicit WorkingDirectory =
+Verifies prerequisites (elevation, PowerShell 7, ffmpeg with libsrt support, a usable
+operator account), copies `.env.example` -> `.env` on first run only (never overwrites
+an operator-edited `.env`), and registers exactly ONE supervisor Scheduled Task,
+'GaplessSupervisor': supervisor.ps1 run as the operator account (the account that ran
+this elevated installer, or -OperatorUserName) under S4U (runs at boot before anyone
+logs on, no stored password), RunLevel Limited, a boot trigger plus a daily 04:05
+watchdog trigger that repeats every 5 minutes (a dead supervisor is relaunched within 5
+minutes, a running one is never touched), no execution time limit, MultipleInstances
+IgnoreNew. The supervisor
+comes up IDLE and streams nothing until an operator explicitly starts it, and it owns
+crash restart (the task settings do NOT restart the action on a non-zero exit; see
+New-AlwaysOnTaskSettingSet). Only AFTER that registration succeeded, the legacy
+'GaplessSrtPusher' SYSTEM task of older installs is retired
+(Remove-LegacySupervisorScheduledTask): unregistered, or only disabled when it is
+running, so a live stream is never touched.
+All Session-0 hardening (PITFALLS.md Pitfall 10) is baked in: an absolute `pwsh.exe`
+path, explicit `-ExecutionPolicy Bypass -NoProfile`, and an explicit WorkingDirectory =
 script root -- a Scheduled Task launches with CWD = %windir%\system32 and cannot
 be assumed to inherit the developer's own execution policy or PATH.
 
 Functions are defined at top level (not wrapped in a module) so
 tests/Install.Tests.ps1 can dot-source this file and Mock Get-Command /
-Get-ScheduledTask / Register-ScheduledTask / Test-IsElevatedProcess /
+Get-ScheduledTask / Register-ScheduledTask / Unregister-ScheduledTask /
+Disable-ScheduledTask / Test-IsElevatedProcess / Get-OperatorAccountProblem /
 Get-FfmpegProtocolsOutput without ever registering a real Scheduled Task --
 real registration needs elevation and a real Windows box, and the real
 reboot/Session-0 verification is deferred manual UAT (see 04-04-PLAN.md
@@ -27,7 +36,9 @@ the bottom of this file.
 Exit codes (this installer's own contract, independent of pusher.ps1's D-12
 runtime exit-code contract): 0 = install succeeded, 1 = one or more
 prerequisites failed (nothing was registered -- never a half-applied install,
-T-04-10).
+T-04-10), 3 = the new task IS registered but the legacy 'GaplessSrtPusher' task is
+still running a supervisor (it was only disabled): action required -- reboot, or end
+that supervisor in a no-stream window, then re-run install.ps1 to delete the task.
 #>
 
 param(
@@ -35,7 +46,12 @@ param(
     # the ssh -L tunnel Scheduled Task + persists the NIC2 VPS route. Never
     # fires as a side effect of a bare `install.ps1` invocation; see
     # Invoke-TunnelRegistration below for why this is a separate opt-in flow.
-    [switch] $RegisterTunnel
+    [switch] $RegisterTunnel,
+
+    # Account the supervisor task runs as. Defaults to the account running this
+    # elevated installer and is never hardcoded (D-09); pass it explicitly when the
+    # installer is elevated under a different account than the operator's.
+    [string] $OperatorUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 )
 
 Set-StrictMode -Version Latest
@@ -48,14 +64,32 @@ Import-Module (Join-Path $PSScriptRoot 'lib/Config.psm1') -Force
 # Fixed TaskName (idempotency key, SVC-02): Register-ScheduledTask -Force always
 # targets this exact name, so re-running install.ps1 updates the same task in
 # place rather than creating a duplicate.
-$script:TaskName = 'GaplessSrtPusher'
+$script:TaskName = 'GaplessSupervisor'
+# Task names earlier installs registered for the same supervisor. Retired after a
+# successful registration: a second task launching supervisor.ps1 at boot was the
+# real second launcher behind the 2026-09-13 and 2026-10-04 incidents.
+$script:LegacySupervisorTaskNames = @('GaplessSrtPusher')
+$script:SupervisorWatchdogTimeOfDay = '04:05'
+# The supervisor's daily trigger repeats this often, so a dead supervisor is back within
+# 5 minutes instead of up to 24 hours. Only the supervisor task repeats (the tunnel
+# task's watchdog stays daily). Depends on the pusher single-instance guard (exit 4)
+# and must never ship without it.
+$script:SupervisorWatchdogRepetitionInterval = New-TimeSpan -Minutes 5
+$script:TunnelWatchdogTimeOfDay = '04:00'
+$script:LocalSystemSid = 'S-1-5-18'
+# Well-known principals that are not a person: LocalService (19), NetworkService (20), and
+# the BUILTIN (32), service (80) and virtual-account (90) groups. SYSTEM (18) is checked
+# first with its own wording.
+$script:NonUserPrincipalSidPattern = '^S-1-5-(18|19|20)$|^S-1-5-(32|80|90)-'
 $script:ExitCodeSuccess = 0
 $script:ExitCodePrerequisiteFailure = 1
+$script:ExitCodeLegacySupervisorStillRunning = 3
 
 # Tunnel autostart (AO-01/D-09, 14.5-06): its own fixed TaskName, distinct from
 # $script:TaskName above, so registering/updating the tunnel task can never
-# collide with or overwrite the pusher's own GaplessSrtPusher task.
+# collide with or overwrite the supervisor's own GaplessSupervisor task.
 $script:TunnelTaskName = 'GaplessTcpRelayTunnel'
+$script:TunnelHelperRelativePath = 'tools/bin/tcp-relay-tunnel.ps1'
 
 function Test-IsElevatedProcess {
     <#
@@ -93,10 +127,47 @@ function Get-FfmpegProtocolsOutput {
     return (& $FfmpegPath -protocols 2>&1 | Out-String)
 }
 
+function Get-OperatorAccountProblem {
+    <#
+    .SYNOPSIS
+    Returns '' when the account the supervisor task will run as is usable, else a
+    one-line problem description. Never throws: an account that cannot be
+    translated to a SID, or that resolves to SYSTEM, is reported as a problem so
+    Test-InstallPrerequisites can abort before anything is registered.
+    SYSTEM is refused because the VPS probe SSH key is ACL'd to the operator only
+    (docs/vps-probe-ssh-key-setup.md) and a SYSTEM-owned supervisor is invisible to
+    the operator's non-elevated tools.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $OperatorUserName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($OperatorUserName)) {
+        return 'Operator account is blank -- pass -OperatorUserName <COMPUTER\user>'
+    }
+
+    try {
+        $operatorSid = ([Security.Principal.NTAccount] $OperatorUserName).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return "Operator account '$OperatorUserName' cannot be resolved -- pass -OperatorUserName <COMPUTER\user>"
+    }
+
+    if ($operatorSid -eq $script:LocalSystemSid) {
+        return "Operator account resolves to SYSTEM -- run install.ps1 elevated from the operator's own account (or pass -OperatorUserName): SYSTEM cannot use the operator's VPS probe SSH key and is invisible to non-elevated operator tools"
+    }
+    if ($operatorSid -match $script:NonUserPrincipalSidPattern) {
+        return "Operator account '$OperatorUserName' is a service account or group, not a user -- pass -OperatorUserName <COMPUTER\user> for the person who operates the stream: a service principal cannot use the operator's VPS probe SSH key and is invisible to non-elevated operator tools"
+    }
+    return ''
+}
+
 function Test-InstallPrerequisites {
     <#
     .SYNOPSIS
-    Checks elevation, PowerShell 7 (pwsh) presence, and ffmpeg-with-SRT support.
+    Checks elevation, PowerShell 7 (pwsh) presence, ffmpeg-with-SRT support, and
+    that the operator account is usable (not SYSTEM, resolvable).
     Mirrors Test-PusherConfig's contract (lib/Config.psm1): returns a problems
     list -- empty means valid -- and NEVER throws or exits itself; the caller
     (Invoke-Install, Task 2) decides how loud to fail. Collects every problem
@@ -106,7 +177,9 @@ function Test-InstallPrerequisites {
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
-    param()
+    param(
+        [string] $OperatorUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    )
 
     $problems = [System.Collections.Generic.List[string]]::new()
 
@@ -127,6 +200,11 @@ function Test-InstallPrerequisites {
         if ($protocolsOutput -notmatch 'srt') {
             $problems.Add("ffmpeg at '$($ffmpegCommand.Source)' does not report SRT protocol support (ffmpeg -protocols | findstr srt found nothing) -- install a libsrt-enabled ffmpeg build (CLAUDE.md-mandated check)")
         }
+    }
+
+    $operatorAccountProblem = Get-OperatorAccountProblem -OperatorUserName $OperatorUserName
+    if ($operatorAccountProblem) {
+        $problems.Add($operatorAccountProblem)
     }
 
     # Unary comma (,) prevents PowerShell's return/pipeline enumeration from
@@ -170,58 +248,164 @@ function Initialize-PusherEnvFile {
     Write-Log -Level Info -Message "First-run: copied .env.example to '$envPath' -- edit .env for this church's deployment before the service starts (CFG-01)"
 }
 
-function Register-PusherScheduledTask {
+function ConvertTo-WallClockStartBoundary {
     <#
     .SYNOPSIS
-    Builds and registers the -AtStartup Scheduled Task per RESEARCH.md Pattern 3
-    (cited Microsoft Learn): absolute pwsh.exe path + explicit WorkingDirectory
-    (Pitfall 10), -AtStartup trigger, bounded RestartCount/RestartInterval +
-    MultipleInstances IgnoreNew (D-10), and SYSTEM/ServiceAccount/Highest
-    principal (T-04-09 -- SYSTEM needs no stored password and runs
-    non-interactively; the recording folder must be a LOCAL/UNC path, not a
-    mapped drive, since SYSTEM cannot see per-session drive mappings, Pitfall 1).
+    Builds a Task Scheduler StartBoundary string for <TimeOfDay> on <Today> with NO
+    UTC offset. Pure and culture-invariant.
+    Why no offset: Task Scheduler pins an offset-carrying StartBoundary to UTC, so a
+    daily trigger created in summer time fires an hour early after the clock change
+    (the GaplessSundayStart 2026-10-25 lesson). A boundary without an offset stays
+    on the local wall clock.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $TimeOfDay,
+        [datetime] $Today = (Get-Date).Date
+    )
+
+    $boundary = $Today.Date + [TimeSpan]::Parse($TimeOfDay)
+    return $boundary.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function New-AlwaysOnTaskTriggerSet {
+    <#
+    .SYNOPSIS
+    The trigger pair every always-on task shares: a boot trigger plus a daily
+    watchdog trigger at <WatchdogTimeOfDay> with an offset-free StartBoundary
+    (see ConvertTo-WallClockStartBoundary). Under MultipleInstances IgnoreNew the
+    daily trigger does nothing while the task is alive and relaunches it if it
+    died. Returned via unary comma so the two-element array survives the pipeline.
+
+    WatchdogRepetitionInterval (default zero = none): when greater than zero, the daily
+    trigger repeats at that interval for one day, which is every minute of every day
+    because the trigger itself fires daily. StopAtDurationEnd is forced to false and is
+    never true: the cmdlet default is true for a finite duration, and a repetition that
+    stops tasks at the end of its duration would make Task Scheduler kill a running
+    supervisor.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $WatchdogTimeOfDay,
+        [TimeSpan] $WatchdogRepetitionInterval = [TimeSpan]::Zero
+    )
+
+    $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+    $dailyWatchdogTrigger = New-ScheduledTaskTrigger -Daily -At $WatchdogTimeOfDay
+    $dailyWatchdogTrigger.StartBoundary = ConvertTo-WallClockStartBoundary -TimeOfDay $WatchdogTimeOfDay
+    if ($WatchdogRepetitionInterval -gt [TimeSpan]::Zero) {
+        $repetitionSource = New-ScheduledTaskTrigger -Once -At '00:00' `
+            -RepetitionInterval $WatchdogRepetitionInterval -RepetitionDuration (New-TimeSpan -Days 1)
+        $dailyWatchdogTrigger.Repetition = $repetitionSource.Repetition
+        # New-ScheduledTaskTrigger leaves StopAtDurationEnd TRUE on a repetition with a
+        # finite duration (verified in memory, 2026-10-18). True would make Task Scheduler
+        # stop the running supervisor when the repetition duration ends, so it is forced off.
+        $dailyWatchdogTrigger.Repetition.StopAtDurationEnd = $false
+    }
+    return , @($bootTrigger, $dailyWatchdogTrigger)
+}
+
+function New-AlwaysOnTaskSettingSet {
+    <#
+    .SYNOPSIS
+    The settings every always-on task shares.
+
+    RestartCount/RestartInterval do NOT restart the action on a non-zero exit code.
+    This was believed for the whole of Phase 4 and is false: Task Scheduler's
+    RestartOnFailure fires only on ABNORMAL TASK termination (a task-engine
+    failure), never when the action process merely exits non-zero. Proven by an
+    isolated probe on the real box -- a task with these exact settings whose action
+    was `pwsh -Command "exit 1"` left lastRun FROZEN and rerun False across 160s,
+    zero relaunches. These settings are kept for the abnormal-termination case they
+    genuinely do cover; PROCESS DEATH IS COVERED BY supervisor.ps1 (and, for the
+    supervisor itself, by the daily watchdog trigger). Phase 2's in-session
+    reconnect loop (RES D-02) still owns network outages -- distinct mechanisms,
+    distinct failures, no overlap.
+
+    MultipleInstances IgnoreNew is PER TASK: it cannot see another task. Two tasks
+    each launching supervisor.ps1 therefore started two supervisors on 2026-09-11
+    and 2026-10-04; the cross-task guard is the per-install single-instance mutex
+    (lib/SupervisorSingleInstance.psm1), not this setting.
+
+    ExecutionTimeLimit zero (PT0S): the Task Scheduler default of PT72H killed the
+    tunnel task on 2026-08-02 and the legacy SYSTEM supervisor at about
+    2026-10-07 14:01 (LastTaskResult 0x00041306). An always-on task must have no
+    time limit. The battery flags keep it running when the box switches to a UPS.
+    #>
+    [CmdletBinding()]
+    param()
+
+    return New-ScheduledTaskSettingsSet `
+        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -MultipleInstances IgnoreNew -StartWhenAvailable `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+}
+
+function New-RepositoryScriptTaskAction {
+    <#
+    .SYNOPSIS
+    The Session-0-hardened action every task shares (PITFALLS.md Pitfall 10): the
+    absolute pwsh.exe path, explicit `-ExecutionPolicy Bypass -NoProfile -File
+    <absolute script>`, and WorkingDirectory = script root (a Scheduled Task
+    launches with CWD = %windir%\system32).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ScriptRoot,
+        [Parameter(Mandatory)] [string] $RelativeScriptPath
+    )
+
+    $pwshPath = (Get-Command -Name 'pwsh.exe' -ErrorAction Stop).Source
+    $scriptPath = Join-Path $ScriptRoot $RelativeScriptPath
+
+    return New-ScheduledTaskAction -Execute $pwshPath `
+        -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`"" `
+        -WorkingDirectory $ScriptRoot
+}
+
+function Register-SupervisorScheduledTask {
+    <#
+    .SYNOPSIS
+    Registers the single supervisor task, 'GaplessSupervisor': supervisor.ps1 run as
+    the operator account under S4U (no stored password, runs at boot before anyone
+    logs on), RunLevel Limited, boot trigger + daily 04:05 watchdog, no execution
+    time limit (shapes: the New-AlwaysOn* helpers above).
+
+    Why the operator account and not SYSTEM: the VPS probe SSH key is ACL'd to the
+    operator only (docs/vps-probe-ssh-key-setup.md), and the task and its processes
+    stay visible and manageable from the operator's non-elevated console.
+
+    The daily trigger is a watchdog that repeats every 5 minutes for 1 day (and fires
+    again the next day). IgnoreNew refuses every fire while the supervisor is alive
+    (TaskScheduler event 322; no process, no log line), so a running supervisor is never
+    touched; a dead one is back within 5 minutes instead of up to 24 h. The repetition
+    never stops tasks at its end (StopAtDurationEnd is forced false). It depends on the
+    pusher single-instance guard (pusher exit 4, supervisor Pusher-mutex probe): a
+    relaunched supervisor must not start a second pusher next to an orphaned one. This
+    repetition must never ship without that guard.
+
     Register-ScheduledTask -Force is the whole idempotency mechanism (SVC-02) --
     a rerun with an existing same-name task updates it in place, never
     duplicates and never throws (T-04-11).
     #>
     [CmdletBinding()]
     param(
-        [string] $ScriptRoot = $PSScriptRoot
+        [string] $ScriptRoot = $PSScriptRoot,
+        [Parameter(Mandatory)] [string] $OperatorUserName
     )
 
-    $pwshCommand = Get-Command -Name 'pwsh.exe' -ErrorAction Stop
-    $pwshPath = $pwshCommand.Source
     # The task launches supervisor.ps1, NOT pusher.ps1 directly. The supervisor comes
     # up IDLE and streams nothing until an operator explicitly starts it (start.ps1 or
     # Phase 5's dashboard Start button) -- a church machine must never begin pushing to
     # a LIVE YouTube audience unattended just because it rebooted. The supervisor is
-    # also what actually restarts a crashed pusher; see the settings note below.
-    $scriptPath = Join-Path $ScriptRoot 'supervisor.ps1'
-
-    $action = New-ScheduledTaskAction -Execute $pwshPath `
-        -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`"" `
-        -WorkingDirectory $ScriptRoot
-
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-
-    # RestartCount/RestartInterval do NOT restart the action on a non-zero exit code.
-    # This was believed for the whole of Phase 4 and is false: Task Scheduler's
-    # RestartOnFailure fires only on ABNORMAL TASK termination (a task-engine
-    # failure), never when the action process merely exits non-zero. Proven by an
-    # isolated probe on the real box -- a task with these exact settings whose action
-    # was `pwsh -Command "exit 1"` left lastRun FROZEN and rerun False across 160s,
-    # zero relaunches. These settings are kept for the abnormal-termination case they
-    # genuinely do cover; PROCESS DEATH IS COVERED BY supervisor.ps1, which is what
-    # this task now launches. Phase 2's in-session reconnect loop (RES D-02) still
-    # owns network outages -- three distinct mechanisms, three distinct failures, no
-    # overlap. MultipleInstances IgnoreNew prevents a boot + a manual run from ever
-    # double-launching two supervisors against the same recording file.
-    $settings = New-ScheduledTaskSettingsSet `
-        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-        -MultipleInstances IgnoreNew -StartWhenAvailable
-
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # also what actually restarts a crashed pusher.
+    $action = New-RepositoryScriptTaskAction -ScriptRoot $ScriptRoot -RelativeScriptPath 'supervisor.ps1'
+    $triggers = New-AlwaysOnTaskTriggerSet -WatchdogTimeOfDay $script:SupervisorWatchdogTimeOfDay `
+        -WatchdogRepetitionInterval $script:SupervisorWatchdogRepetitionInterval
+    $settings = New-AlwaysOnTaskSettingSet
+    $principal = New-ScheduledTaskPrincipal -UserId $OperatorUserName -LogonType S4U -RunLevel Limited
 
     $existingTask = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     if ($existingTask) {
@@ -230,26 +414,97 @@ function Register-PusherScheduledTask {
         Write-Log -Level Info -Message "No existing Scheduled Task '$script:TaskName' found -- installing fresh"
     }
 
-    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
+    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $triggers `
         -Settings $settings -Principal $principal -Force | Out-Null
 
-    Write-Log -Level Info -Message "Scheduled Task '$script:TaskName' registered -- runs supervisor.ps1 at boot as SYSTEM/ServiceAccount, MultipleInstances IgnoreNew (SVC-01/T-04-09/T-04-11)"
+    Write-Log -Level Info -Message "Scheduled Task '$script:TaskName' registered -- runs supervisor.ps1 as '$OperatorUserName' (S4U: no stored password, runs at boot before anyone logs on), boot trigger + daily $script:SupervisorWatchdogTimeOfDay watchdog repeating every 5 minutes (a dead supervisor is relaunched within 5 minutes; a running one is never touched), no execution time limit, MultipleInstances IgnoreNew (SVC-01/T-04-11)"
+}
+
+function Remove-LegacySupervisorScheduledTask {
+    <#
+    .SYNOPSIS
+    Retires supervisor tasks registered by older installs ($script:LegacySupervisorTaskNames).
+    Called only AFTER Register-SupervisorScheduledTask returned without throwing, so
+    there are never zero supervisor tasks.
+
+    Absent: skipped. Running: Disable-ScheduledTask only -- the running process is
+    left alone (no stream kills) and the task is deleted by a later install.ps1 run,
+    once that supervisor is gone (reboot, or ended in a no-stream window).
+    Otherwise: Unregister-ScheduledTask. It never calls Stop-ScheduledTask.
+
+    .OUTPUTS
+    Bool: $true when at least one legacy task was left running (the caller must not
+    report a clean install), else $false.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    $anyLegacyTaskLeftRunning = $false
+    foreach ($legacyTaskName in $script:LegacySupervisorTaskNames) {
+        $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+        if (-not $legacyTask) {
+            continue
+        }
+
+        if ($legacyTask.State -eq 'Running') {
+            Disable-ScheduledTask -TaskName $legacyTaskName | Out-Null
+            $runDetailText = Get-LegacyTaskRunDetailText -ScheduledTask $legacyTask
+            Write-Log -Level Warning -Message "Legacy Scheduled Task '$legacyTaskName' is still running a supervisor (possibly the only one) -- disabled so it never launches at boot again; the running process was left alone (no stream kills). $runDetailText Remedy: reboot (the disabled task will not launch again), or end that supervisor in a no-stream window, then re-run install.ps1 to delete the task."
+            $anyLegacyTaskLeftRunning = $true
+            continue
+        }
+
+        Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
+        Write-Log -Level Info -Message "Removed legacy Scheduled Task '$legacyTaskName' (duplicate SYSTEM supervisor launcher)"
+    }
+    return $anyLegacyTaskLeftRunning
+}
+
+function Get-LegacyTaskRunDetailText {
+    <#
+    .SYNOPSIS
+    One sentence for the operator: when the running legacy task last started and when the
+    Task Scheduler's own execution time limit would end it (last run + limit; a limit of
+    zero means the scheduler never ends it). Never throws -- unreadable details degrade to
+    "unknown", because this only decorates a warning.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] $ScheduledTask
+    )
+
+    $lastRunText = 'unknown'
+    $killDeadlineText = 'unknown'
+    try {
+        $lastRunTime = (Get-ScheduledTaskInfo -TaskName $ScheduledTask.TaskName -ErrorAction Stop).LastRunTime
+        $lastRunText = $lastRunTime.ToString('yyyy-MM-dd HH:mm:ss')
+        $executionTimeLimit = [System.Xml.XmlConvert]::ToTimeSpan([string] $ScheduledTask.Settings.ExecutionTimeLimit)
+        $killDeadlineText = if ($executionTimeLimit -le [timespan]::Zero) {
+            'none (no execution time limit)'
+        } else {
+            $lastRunTime.Add($executionTimeLimit).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+    } catch {
+        # Fall through with whatever was readable.
+    }
+    return "Last run: $lastRunText; Task Scheduler kill deadline: $killDeadlineText."
 }
 
 function Register-TunnelScheduledTask {
     <#
     .SYNOPSIS
     Registers tools/bin/tcp-relay-tunnel.ps1 (the ssh -L tunnel loop) as its own
-    -AtStartup Scheduled Task, mirroring Register-PusherScheduledTask's exact
-    shape (absolute pwsh.exe path, explicit WorkingDirectory, bounded
-    RestartCount/RestartInterval, MultipleInstances IgnoreNew, SYSTEM/
-    ServiceAccount/Highest principal) so the tunnel survives a church-PC
-    reboot/logout the same way the pusher supervisor already does (AO-01,
-    D-09). SYSTEM needs no stored password and runs before any interactive
-    logon, which is the whole point of "always-on" -- and SYSTEM already has
-    read access to the askpass credential path under the operator's own
-    profile via the default C:\Users ACL, same as the pusher's own SYSTEM
-    task already relies on for the recording folder.
+    Scheduled Task so the tunnel survives a church-PC reboot/logout (AO-01, D-09).
+    It shares the supervisor task's trigger/settings/action helpers (boot + daily
+    04:00 watchdog, no execution time limit), so a -RegisterTunnel re-run can no
+    longer bring back the 72 h kill (2026-08-02) the PT0S fix removed.
+
+    It does NOT mirror the supervisor's principal: SYSTEM stays because the tunnel
+    needs no operator-only key and must run regardless of who is logged on. SYSTEM
+    needs no stored password and runs before any interactive logon, which is the
+    whole point of "always-on".
 
     Register-ScheduledTask -Force is the idempotency mechanism (AO-01
     adjacency edge, mirrors SVC-02): a re-run with an existing same-name task
@@ -260,24 +515,16 @@ function Register-TunnelScheduledTask {
         [string] $ScriptRoot = $PSScriptRoot
     )
 
-    $pwshCommand = Get-Command -Name 'pwsh.exe' -ErrorAction Stop
-    $pwshPath = $pwshCommand.Source
-    $scriptPath = Join-Path $ScriptRoot 'tools/bin/tcp-relay-tunnel.ps1'
+    $scriptPath = Join-Path $ScriptRoot $script:TunnelHelperRelativePath
 
     if (-not (Test-Path -LiteralPath $scriptPath)) {
         Write-Log -Level Warning -Message "Register-TunnelScheduledTask: tunnel helper script not found at '$scriptPath' -- no Scheduled Task was registered. This deployment does not ship the ssh-forwarding tunnel helper, which is only needed when the relay is not directly reachable from the OBS machine; a directly-reachable relay needs no tunnel, so this skip is expected and harmless."
         return
     }
 
-    $action = New-ScheduledTaskAction -Execute $pwshPath `
-        -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`"" `
-        -WorkingDirectory $ScriptRoot
-
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-        -MultipleInstances IgnoreNew -StartWhenAvailable
+    $action = New-RepositoryScriptTaskAction -ScriptRoot $ScriptRoot -RelativeScriptPath $script:TunnelHelperRelativePath
+    $triggers = New-AlwaysOnTaskTriggerSet -WatchdogTimeOfDay $script:TunnelWatchdogTimeOfDay
+    $settings = New-AlwaysOnTaskSettingSet
 
     $principal = New-ScheduledTaskPrincipal `
         -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -289,10 +536,10 @@ function Register-TunnelScheduledTask {
         Write-Log -Level Info -Message "No existing Scheduled Task '$script:TunnelTaskName' found -- installing fresh"
     }
 
-    Register-ScheduledTask -TaskName $script:TunnelTaskName -Action $action -Trigger $trigger `
+    Register-ScheduledTask -TaskName $script:TunnelTaskName -Action $action -Trigger $triggers `
         -Settings $settings -Principal $principal -Force | Out-Null
 
-    Write-Log -Level Info -Message "Scheduled Task '$script:TunnelTaskName' registered -- runs tools/bin/tcp-relay-tunnel.ps1 at boot as SYSTEM/ServiceAccount"
+    Write-Log -Level Info -Message "Scheduled Task '$script:TunnelTaskName' registered -- runs tools/bin/tcp-relay-tunnel.ps1 at boot as SYSTEM/ServiceAccount, daily $script:TunnelWatchdogTimeOfDay watchdog, no execution time limit"
 }
 
 function Get-VpsRouteConfiguration {
@@ -529,8 +776,10 @@ function Invoke-Install {
     .SYNOPSIS
     Main install flow: validate prerequisites (bail loud+non-zero before touching
     anything if invalid, T-04-10), then first-run .env copy, then register the
-    Scheduled Task. Never a half-applied install -- registration only runs once
-    every prerequisite problem is resolved.
+    GaplessSupervisor Scheduled Task, and only then retire the legacy
+    GaplessSrtPusher task (a registration that throws never reaches the removal,
+    so there are never zero supervisor tasks). Never a half-applied install --
+    registration only runs once every prerequisite problem is resolved.
 
     RETURNS this installer's exit code rather than calling `exit` itself: `exit`
     is a flow-control exception that tears down the whole host, so an
@@ -541,10 +790,16 @@ function Invoke-Install {
     (CLAUDE.md: side effects isolated at edges). Every logging path stays on the
     error/warning/host streams (lib/Logging.psm1), so nothing pollutes the
     returned exit code.
+
+    Exit codes: 0 = installed; 1 = prerequisite failure (nothing registered); 3 = the new
+    task is registered but a legacy supervisor task is still running and was only
+    disabled (action required: reboot or end it in a no-stream window, then re-run).
     #>
     [CmdletBinding()]
     [OutputType([int])]
-    param()
+    param(
+        [string] $OperatorUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    )
 
     Write-Log -Level Info -Message "Gapless SRT Pusher installer starting (script root '$PSScriptRoot')"
 
@@ -558,7 +813,7 @@ function Invoke-Install {
     # VARIABLE is safe -- that enumerates the array -- which is exactly why the
     # `@($problems).Count | Should -Be 0` unit assertion stayed green while the
     # real installer crashed. Mirrors pusher.ps1:64 / Test-PusherConfig.)
-    $problems = Test-InstallPrerequisites
+    $problems = Test-InstallPrerequisites -OperatorUserName $OperatorUserName
     if ($problems.Count -gt 0) {
         foreach ($problem in $problems) {
             Write-Log -Level Error -Message "Prerequisite check failed: $problem"
@@ -568,9 +823,15 @@ function Invoke-Install {
     }
 
     Initialize-PusherEnvFile -ScriptRoot $PSScriptRoot
-    Register-PusherScheduledTask -ScriptRoot $PSScriptRoot
+    Register-SupervisorScheduledTask -ScriptRoot $PSScriptRoot -OperatorUserName $OperatorUserName
+    $legacyTaskLeftRunning = @(Remove-LegacySupervisorScheduledTask) -contains $true
 
-    Write-Log -Level Info -Message "Install complete. Scheduled Task '$script:TaskName' will start supervisor.ps1 at boot (SVC-01)."
+    if ($legacyTaskLeftRunning) {
+        Write-Log -Level Error -Message "Install incomplete -- action required. Scheduled Task '$script:TaskName' is registered as '$OperatorUserName', but the legacy supervisor task is still running a supervisor (it was only disabled, nothing was stopped). Reboot (the disabled task will not launch again), or end that supervisor in a no-stream window, then re-run install.ps1 to delete the legacy task. Exit code $script:ExitCodeLegacySupervisorStillRunning."
+        return $script:ExitCodeLegacySupervisorStillRunning
+    }
+
+    Write-Log -Level Info -Message "Install complete. Scheduled Task '$script:TaskName' will start supervisor.ps1 at boot as '$OperatorUserName' (SVC-01)."
     Write-Log -Level Info -Message 'The supervisor comes up IDLE at boot -- it streams NOTHING until you start it. Run start.ps1 to begin a service and stop.ps1 to end it (Phase 5''s dashboard buttons write the same control flag, state/control.json).'
     Write-Log -Level Info -Message 'pusher.ps1 exit-code contract (D-12), enforced by supervisor.ps1: 0 = clean end-of-service (stays down, and the control flag is set back to stopped), 2 = config validation failure (stays down -- fix .env, then run start.ps1 again), any other non-zero = crash (the supervisor relaunches the pusher automatically with backoff; the recording file on disk is the buffer, so the stream catches back up).'
     return $script:ExitCodeSuccess
@@ -590,5 +851,5 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($RegisterTunnel) {
         exit (Invoke-TunnelRegistration)
     }
-    exit (Invoke-Install)
+    exit (Invoke-Install -OperatorUserName $OperatorUserName)
 }

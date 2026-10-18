@@ -10,13 +10,15 @@
 # path and override the size cap / retention count after startup.
 #
 # Rotation runs inline on Write-Log's existing Add-Content path -- there is no
-# background job/runspace. This keeps it safe for Add-Content's open-write-
-# close-per-call behavior with a single writer (A2), but it is NOT yet
-# thread-safe: a second concurrent writer (e.g. a future Phase 5 dashboard
-# runspace) would need locking added here (T-04-08, single-writer scope).
+# background job/runspace. There is NO locking: five or more concurrent writers
+# exist in production (the supervisor main thread, the dashboard runspace, the
+# probe runspace, the pusher, and start/stop/cut), and the torn log line at
+# 2026-10-04 14:04:28 shows they do collide. No locking is added here (T-04-08
+# stays open). Instead, file I/O in Write-Log is best-effort and never throws: a
+# lost or torn line is acceptable, a dead supervisor is not.
 #
 # Exports: Write-Log, Set-LogDirectory, Set-LogRotationPolicy, Get-LogFilePath,
-# Invoke-LogRotationIfNeeded
+# Invoke-LogRotationIfNeeded, Get-ProcessIdentityLogText
 
 Set-StrictMode -Version Latest
 
@@ -88,10 +90,10 @@ function Invoke-LogFileOperationWithRetry {
     retrying with a short backoff on a transient IOException/
     UnauthorizedAccessException -- the same AV/indexer-lock discipline
     OffsetStore.psm1's Save-PusherOffset already applies to its own atomic
-    rename. A persistent failure still throws after the final attempt; the
-    caller (Invoke-LogRotationIfNeeded) is itself called from Write-Log,
-    which is expected to let this propagate rather than silently swallow a
-    real, non-transient rotation failure.
+    rename. A persistent failure still throws after the final attempt to a
+    direct caller; Write-Log (which reaches this through
+    Invoke-LogRotationIfNeeded) absorbs it, because logging must never take
+    down its caller (261018).
     #>
     [CmdletBinding()]
     param(
@@ -136,8 +138,9 @@ function Invoke-LogRotationIfNeeded {
         [int] $RetentionCount
     )
 
-    if (-not (Test-Path -LiteralPath $LogFilePath)) { return }
-    if ((Get-Item -LiteralPath $LogFilePath).Length -lt $MaxSizeBytes) { return }
+    $activeLogFile = Get-Item -LiteralPath $LogFilePath -ErrorAction SilentlyContinue
+    if ($null -eq $activeLogFile) { return }
+    if ($activeLogFile.Length -lt $MaxSizeBytes) { return }
 
     $oldestKept = "$LogFilePath.$RetentionCount"
     if (Test-Path -LiteralPath $oldestKept) {
@@ -153,6 +156,36 @@ function Invoke-LogRotationIfNeeded {
     }
 
     Invoke-LogFileOperationWithRetry -Operation { Move-Item -LiteralPath $LogFilePath -Destination "$LogFilePath.1" -Force }
+}
+
+function Get-ProcessIdentityLogText {
+    <#
+    .SYNOPSIS
+    One-line identity of THIS process for start-up log lines:
+    "pid=<pid> ppid=<parent pid or unknown> user=<account> session=<session id> started=<ISO time>".
+    The parent pid may be unreadable (for example Task Scheduler's svchost parent under a
+    limited token), so a missing parent is "unknown", never claimed to be absent.
+
+    WHY: on 2026-10-04 two supervisors ran side by side and nothing in the log said which
+    was which. user= alone would have proved SYSTEM versus the operator account, and the
+    pid maps to its trigger in the TaskScheduler/Operational log (event 129).
+
+    No CIM: WMI can stall about 70 s after boot, and the PowerShell 7 Process.Parent is
+    enough. Never throws: any failure degrades to just "pid=<pid>", so a logging aid can
+    never block a start-up line.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    try {
+        $currentProcess = Get-Process -Id $PID -ErrorAction Stop
+        $parentProcessText = if ($null -eq $currentProcess.Parent) { 'unknown' } else { $currentProcess.Parent.Id }
+        $accountName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        return "pid=$PID ppid=$parentProcessText user=$accountName session=$($currentProcess.SessionId) started=$($currentProcess.StartTime.ToString('o'))"
+    } catch {
+        return "pid=$PID"
+    }
 }
 
 function Write-Log {
@@ -174,9 +207,24 @@ function Write-Log {
     $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
     $formattedLine = "[$timestamp] [$Level] $Message"
 
-    $logFilePath = Get-LogFilePath
-    Invoke-LogRotationIfNeeded -LogFilePath $logFilePath -MaxSizeBytes $script:LogMaxSizeBytes -RetentionCount $script:LogRetentionCount
-    Add-Content -LiteralPath $logFilePath -Value $formattedLine
+    # Best-effort by design (261018): under $ErrorActionPreference = 'Stop', a throw here on
+    # the supervisor's main thread would end the supervisor with no log line, which is the
+    # silent-death signature of 2026-10-04. Rotation and append are INDEPENDENT best-effort
+    # steps: a failed rotation (locked chain) must not drop an append that would succeed.
+    # The console / error-stream emit below still runs, so a line is never lost entirely.
+    $logFilePath = $null
+    try {
+        $logFilePath = Get-LogFilePath
+        Invoke-LogRotationIfNeeded -LogFilePath $logFilePath -MaxSizeBytes $script:LogMaxSizeBytes -RetentionCount $script:LogRetentionCount
+    } catch {
+        # Rotation failed; fall through to the append.
+    }
+    try {
+        if ($null -eq $logFilePath) { $logFilePath = Get-LogFilePath }
+        Add-Content -LiteralPath $logFilePath -Value $formattedLine
+    } catch {
+        # Append failed (locked / disk full); the emit below is the only copy of this line.
+    }
 
     # -ErrorAction/-WarningAction Continue is explicit and NON-negotiable here (RES-01
     # bug fix, 02-07): Write-Log has no CmdletBinding, so $ErrorActionPreference is
@@ -198,4 +246,4 @@ function Write-Log {
     }
 }
 
-Export-ModuleMember -Function Write-Log, Set-LogDirectory, Set-LogRotationPolicy, Get-LogFilePath, Invoke-LogRotationIfNeeded
+Export-ModuleMember -Function Write-Log, Set-LogDirectory, Set-LogRotationPolicy, Get-LogFilePath, Invoke-LogRotationIfNeeded, Get-ProcessIdentityLogText

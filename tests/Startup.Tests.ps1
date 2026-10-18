@@ -30,6 +30,10 @@ BeforeAll {
 
         $pusherSource = Get-Content -LiteralPath $script:PusherSourcePath -Raw
         $pusherSource = $pusherSource -replace "(?m)^\`$envPath\s*=.*$", "`$envPath = '$EnvFilePath'"
+        # The copy sits in the repo root: without this rewrite it would take the PRODUCTION
+        # Pusher mutex (named from the script's own directory) and block the live supervisor.
+        $scopeRootForCopy = Join-Path ([System.IO.Path]::GetTempPath()) ("pusher-startuptest-scope-{0}" -f ([Guid]::NewGuid()))
+        $pusherSource = $pusherSource -replace "(?m)^\`$pusherSingleInstanceScopeRoot\s*=.*$", "`$pusherSingleInstanceScopeRoot = '$scopeRootForCopy'"
 
         $testPusherPath = Join-Path $script:RepoRootPath (".pusher.startuptest.{0}.ps1" -f ([Guid]::NewGuid()))
         Set-Content -LiteralPath $testPusherPath -Value $pusherSource -Encoding utf8
@@ -219,6 +223,21 @@ Describe 'pusher.ps1 startup config contract' -Tag 'Quick' {
         $result.StdOut | Should -Match 'REDACTED'
     }
 
+    It 'the scratch startup copy never scopes the Pusher mutex to the repo root (261018, production isolation)' {
+        # A copy written into the repo root that kept pusher.ps1's default
+        # ($pusherSingleInstanceScopeRoot = $PSScriptRoot) would take the PRODUCTION
+        # Pusher mutex when the suite runs from the live install, and the live
+        # supervisor's orphan probe would then refuse to launch its pusher.
+        $script:TestPusherPath = New-TestTunedStartupPusherCopy -EnvFilePath (Join-Path $TestDrive '.env.scope-check')
+
+        $scopeMatch = [regex]::Match((Get-Content -LiteralPath $script:TestPusherPath -Raw), "(?m)^\`$pusherSingleInstanceScopeRoot = '([^']+)'\s*$")
+        $scopeMatch.Success | Should -BeTrue -Because 'the startup copy must rewrite $pusherSingleInstanceScopeRoot to a literal path'
+        $scopeRoot = $scopeMatch.Groups[1].Value
+        $scopeRoot | Should -Not -Be $script:RepoRootPath
+        $scopeRoot.StartsWith($script:RepoRootPath, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
+        $scopeRoot.StartsWith([System.IO.Path]::GetTempPath().TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+    }
+
     It 'binds every -FileLastWriteTimeUtc argument in pusher.ps1 to a UTC-valued expression (260816-g70, START-STALE-02)' {
         # The 2026-08-16 investigation into the stale-file Start guard holding for 8
         # minutes suspected a local-vs-UTC mismatch at this call site: if
@@ -249,5 +268,91 @@ Describe 'pusher.ps1 startup config contract' -Tag 'Quick' {
             $boundExpression = $bindingMatch.Groups[1].Value
             $boundExpression | Should -Match 'Utc$' -Because "the -FileLastWriteTimeUtc argument '$boundExpression' must be bound to a UTC-named expression, never a local-time property"
         }
+    }
+
+    It 'the single "Pusher starting" Write-Log message embeds Get-ProcessIdentityLogText (261018, B4)' {
+        # AST, not text: pusher.ps1 has exactly one Write-Log whose -Message is the
+        # interpolated "Pusher starting ..." string, and that string must call the
+        # shared identity helper so the pusher's start line names its pid/ppid/user.
+        $parseErrors = $null
+        $pusherSyntaxTree = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script:PusherSourcePath).Path, [ref]$null, [ref]$parseErrors)
+        $parseErrors.Count | Should -Be 0
+
+        $startingMessageArguments = [System.Collections.Generic.List[object]]::new()
+        $writeLogCalls = $pusherSyntaxTree.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Log'
+        }, $true)
+        foreach ($writeLogCall in $writeLogCalls) {
+            $elements = @($writeLogCall.CommandElements)
+            for ($index = 0; $index -lt $elements.Count - 1; $index++) {
+                $isMessageParameter = $elements[$index] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    $elements[$index].ParameterName -eq 'Message'
+                if ($isMessageParameter -and $elements[$index + 1].Extent.Text.StartsWith('"Pusher starting')) {
+                    $startingMessageArguments.Add($elements[$index + 1])
+                }
+            }
+        }
+
+        $startingMessageArguments.Count | Should -Be 1
+        $identityCalls = @($startingMessageArguments[0].FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Get-ProcessIdentityLogText'
+        }, $true))
+        $identityCalls.Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'takes the Pusher single-instance mutex after Set-LogDirectory and before any hot-path import, and the loser exits with ExitCodeAnotherPusherRunning (261018, B6)' {
+        # AST over the top-level statement order: the guard must run before the offset,
+        # the control flag, the recording file or ffmpeg are touched, so a second pusher
+        # for the same install stands down without side effects.
+        $parseErrors = $null
+        $pusherSyntaxTree = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script:PusherSourcePath).Path, [ref]$null, [ref]$parseErrors)
+        $parseErrors.Count | Should -Be 0
+
+        $topLevelStatements = @($pusherSyntaxTree.EndBlock.Statements)
+        $findStatementIndex = {
+            param([string] $Pattern)
+            for ($index = 0; $index -lt $topLevelStatements.Count; $index++) {
+                if ($topLevelStatements[$index].Extent.Text -match $Pattern) { return $index }
+            }
+            return -1
+        }
+
+        $setLogDirectoryIndex = & $findStatementIndex '^Set-LogDirectory'
+        $guardIndex = & $findStatementIndex 'Enter-SupervisorSingleInstance'
+        $offsetStoreImportIndex = & $findStatementIndex 'OffsetStore\.psm1'
+
+        $setLogDirectoryIndex | Should -BeGreaterOrEqual 0
+        $guardIndex | Should -BeGreaterThan $setLogDirectoryIndex
+        $offsetStoreImportIndex | Should -BeGreaterThan $guardIndex
+
+        $guardStatementText = $topLevelStatements[$guardIndex].Extent.Text
+        $guardStatementText | Should -Match "-Role\s+'Pusher'"
+
+        $loserBranch = $topLevelStatements[$guardIndex + 1]
+        $loserBranch | Should -BeOfType ([System.Management.Automation.Language.IfStatementAst])
+        $loserExits = @($loserBranch.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.ExitStatementAst]
+        }, $true))
+        $loserExits.Count | Should -Be 1
+        $loserExits[0].Pipeline.Extent.Text | Should -Be '$script:ExitCodeAnotherPusherRunning'
+    }
+
+    It 'releases the Pusher mutex in a finally around Start-Pusher (261018, B6)' {
+        $parseErrors = $null
+        $pusherSyntaxTree = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script:PusherSourcePath).Path, [ref]$null, [ref]$parseErrors)
+
+        $guardedStartStatements = @($pusherSyntaxTree.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.TryStatementAst] -and
+            $_.Body.Extent.Text -match 'Start-Pusher' -and
+            $null -ne $_.Finally -and $_.Finally.Extent.Text -match 'Exit-SupervisorSingleInstance'
+        })
+
+        $guardedStartStatements.Count | Should -Be 1
     }
 }

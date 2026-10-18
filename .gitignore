@@ -25,3 +25,14 @@ tools/bin/askpass*.cmd
 # Local run logs
 logs/
 tools/logs/
+
+# GSD runtime state (planning artifacts under .planning/ stay tracked)
+.gsd/
+
+# One-shot run media stays on disk under runs/YYYY-MM-DD-<slug>/, never committed
+runs/**/*.wav
+runs/**/*.m4a
+runs/**/*.mp3
+runs/**/*.mp4
+runs/**/*.ts
+runs/**/*.flac

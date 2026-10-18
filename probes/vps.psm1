@@ -39,8 +39,9 @@
 #    V5/Tampering control (T-06-02/T-15-02-01) that keeps an attacker-influenced .env SSH
 #    host/user/keypath/port value from injecting extra ssh flags or a second command. ONE
 #    remote command (`systemctl is-active <3 units>`, and on the tcp path ONLY, a trailing
-#    `; echo ---; ss -Htan '( sport = :<port> )'` section) covers unit health AND Port state
-#    in the SAME SSH round trip -- Test-SmoothRelayHealth replaces the old ambiguous
+#    `; echo ---; ss -Htan '( sport = :<port> )'` section, THEN (260830-ffp, D-01) a second
+#    `echo ---` plus a per-channel egress loop) covers unit health, Port state, AND the two
+#    YouTube egress rows in the SAME SSH round trip -- Test-SmoothRelayHealth replaces the old ambiguous
 #    `pgrep -f 'ffmpeg.*-c copy'` leg, which matched all three of the current architecture's
 #    processes indistinguishably. It degrades gracefully (never a hard failure) when SSH is
 #    unconfigured, when ssh.exe is absent from PATH (Pitfall 3), or when the ssh invocation
@@ -132,12 +133,17 @@ $script:TunnelScheduledTaskName = 'GaplessTcpRelayTunnel'
 # poll.
 $script:SshLegMinimumIntervalSeconds = 60
 # Bumped whenever the cache payload's own shape changes incompatibly -- 2 as of 260809-oc4
-# (added the portState field alongside unitStates); a stored schemaVersion mismatch (or its
-# absence) makes Read-SshLegCache discard the file exactly like a corrupt one, never a
-# StrictMode surprise on a stale-shaped payload. This also means a cache file written by
-# the PRE-redesign module version is automatically discarded on the first poll after a
-# bounce, rather than silently missing PortState.
-$script:SshLegCacheSchemaVersion = 2
+# (added the portState field alongside unitStates), 3 as of 260830-ffp (added the
+# egressStates field alongside unitStates/portState, D-06); a stored schemaVersion
+# mismatch (or its absence) makes Read-SshLegCache discard the file exactly like a
+# corrupt one, never a StrictMode surprise on a stale-shaped payload. This also means a
+# cache file written by ANY pre-260830-ffp module version (schemaVersion 1 or 2, missing
+# egressStates entirely) is automatically discarded on the first poll after a bounce,
+# rather than silently missing EgressStates. 4 as of 260906-i2k (added the readerHealth
+# field, D-11): every schemaVersion-3 payload predates the reader-health counters, so
+# bumping is what forces the SSH leg to re-run once and populate them instead of the
+# Rotations/Discontinuities rows reading 'unknown' for up to a full throttle interval.
+$script:SshLegCacheSchemaVersion = 4
 $script:SshLegCacheFileName = 'vps-probe-ssh-cache.json'
 # 260809-oc4: the deterministic alignment marker printed BETWEEN the `systemctl is-active`
 # section and the `ss` section of the single combined SSH remote command (tcp path only) --
@@ -147,6 +153,21 @@ $script:SshLegCacheFileName = 'vps-probe-ssh-cache.json'
 # aligned at all and is treated as fully unknown (both unit states AND Port state), never a
 # guessed split.
 $script:SmoothRelaySshSectionSeparator = '---'
+# 260830-ffp (D-04): a channel is reported 'sending' when its ffmpeg child's lastsnd
+# (milliseconds since the kernel last sent data on that TCP socket) is below this
+# threshold, else 'stalled Ns'. Set comfortably above the 60s SSH-leg throttle
+# ($script:SshLegMinimumIntervalSeconds) divided by 6 -- a sample this stale already
+# tolerates multi-second gaps between polls, so 10s of no send activity is a real,
+# actionable stall signal, not throttle-interval jitter.
+$script:VpsEgressStalledThresholdMilliseconds = 10000
+# 260906-i2k (D-09): the VPS-side path smooth-watchdog-ingest.sh publishes its two
+# reader-health counters to, once per 1-minute watchdog tick. Hardcoded as a module-scope
+# literal rather than read from any env var, because the remote command runs in a
+# NON-LOGIN shell over ssh where the watchdog's own WATCHDOG_STATE_DIR does not exist --
+# an env read there would silently resolve to nothing and cat a bare '/reader-health'.
+# Must stay in step with $READER_HEALTH_FILE's default in
+# tools/smooth-relay/smooth-watchdog-ingest.sh.
+$script:VpsReaderHealthRemotePath = '/run/smooth-watchdog/reader-health'
 
 function New-SrtInductionPacketBytes {
     <#
@@ -511,6 +532,197 @@ function Invoke-SshCommand {
     }
 }
 
+function Get-VpsEgressChannelIds {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260830-ffp/D-02: derives the ordered egress channel ids
+    from $script:SmoothRelayUnitNames by matching the systemd template-instance pattern
+    ^smooth-youtube@(?<channel>[a-z]+)\.service$ -- NEVER a second hardcoded list, never
+    anything .env-sourced. The unit list stays the single source of truth for which
+    egress channels exist: a future rename or addition there is the only edit needed to
+    change the egress rows too.
+
+    .OUTPUTS
+    string[] -- ordered lowercase channel ids (e.g. 'lv', 'ru'), in
+    $script:SmoothRelayUnitNames order.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    $channelIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($unitName in $script:SmoothRelayUnitNames) {
+        if ($unitName -match '^smooth-youtube@(?<channel>[a-z]+)\.service$') {
+            $channelIds.Add($Matches['channel'])
+        }
+    }
+    return , $channelIds.ToArray()
+}
+
+function New-VpsEgressRemoteCommandSection {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260830-ffp/D-01/D-07: builds the third `;`-chained
+    remote-command section (the egress loop), appended after a second section separator
+    on the tcp path only. ChannelIds are interpolated via plain string concatenation
+    (D-02); EVERYTHING from '; do' onward is a SINGLE-quoted PowerShell literal, copied
+    byte-for-byte from the plan's verified reference command, so the shell's own
+    ${mp:-0} default-value expression, the "$fp," comma fragment, and every other
+    dollar-sign token reach the remote bash verbatim -- a double-quoted PowerShell
+    string would silently interpolate (and blank) each of them before ssh ever sees the
+    command.
+
+    The `printf "%s " "$c"` prefix (the one addition to the verified form) is load-
+    bearing: Invoke-SshCommand drops blank stdout lines, so a channel with no ffmpeg
+    child would otherwise vanish and silently break line-for-line channel alignment; the
+    prefix also makes each line self-identifying, which ConvertTo-VpsEgressStates relies
+    on as an independent cross-check against the expected channel-id order (D-03).
+
+    Known limitation (by design, not a bug): this reads only bytes_sent/lastsnd tokens
+    from `ss -p` -- the RTMPS stream key is never in `ss` output (process NAME only,
+    never a command line) and is never transmitted back. A VPS missing `pgrep` reads as
+    'no connection' rather than 'unknown'; acceptable since the value is indicator-only
+    (D-05).
+
+    .OUTPUTS
+    String -- the loop section only (no leading/trailing separator or `;`).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string[]] $ChannelIds
+    )
+
+    return "for c in $($ChannelIds -join ' '); " + 'do mp=$(systemctl show -p MainPID --value smooth-youtube@$c.service); fp=$(pgrep -P ${mp:-0} -x ffmpeg | head -1); printf "%s " "$c"; if [ -n "$fp" ]; then ss -Htinp state established "( dport = :443 )" | grep -A1 "pid=$fp," | grep -o -e "bytes_sent:[0-9]*" -e "lastsnd:[0-9]*" | tr "\n" " "; fi; echo; done'
+}
+
+function New-VpsReaderHealthRemoteCommandSection {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260906-i2k/D-09: builds the FOURTH `;`-chained remote-command
+    section -- a plain `cat` of $script:VpsReaderHealthRemotePath with stderr discarded --
+    appended after a THIRD section separator on the tcp path only. stderr is discarded and
+    no `|| true` is needed because the whole remote command is a `;`-chained list, not a
+    `&&` chain: a missing file simply contributes zero lines, which
+    ConvertTo-VpsReaderHealthState resolves to $null (D-10), exactly like a watchdog that
+    has not ticked yet.
+
+    .OUTPUTS
+    String -- the cat section only (no leading/trailing separator or `;`).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return "cat $script:VpsReaderHealthRemotePath 2>/dev/null"
+}
+
+function ConvertTo-VpsReaderHealthState {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260906-i2k/D-10: parses the fourth reader-health section's
+    lines into {Discontinuities; Rotations} as [int64], or $null when the section cannot
+    be trusted -- zero lines (no file, watchdog not ticked yet, or no third separator in
+    the reply), either key missing, or either value not a plain integer.
+
+    Parses BY KEY, never by line position, so a future key-order change in
+    write_reader_health cannot silently swap the two counts. Each key is matched with an
+    ANCHORED regex that tolerates surrounding whitespace and accepts DIGITS ONLY
+    (T-i2k-01): the payload crosses a trust boundary from the VPS onto the church PC and
+    into the dashboard, so nothing from it is ever rendered verbatim -- the row value
+    comes from a fixed vocabulary and the unit is a re-formatted integer.
+
+    Per D-10 the caller treats a $null here as "these two rows are unknown" and NOTHING
+    else: never a retry, never a change to unit/Port/egress state, never an input to the
+    ok/degraded/down fold.
+
+    .OUTPUTS
+    PSCustomObject{Discontinuities; Rotations} ([int64] each), or $null.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [array] $ReaderHealthLines
+    )
+
+    if ($ReaderHealthLines.Count -eq 0) {
+        return $null
+    }
+
+    $parsedCounts = @{}
+    foreach ($readerHealthLine in $ReaderHealthLines) {
+        $keyValueMatch = [regex]::Match($readerHealthLine, '^\s*(?<key>discontinuities|rotations)\s*=\s*(?<value>\d+)\s*$')
+        if ($keyValueMatch.Success) {
+            $parsedCounts[$keyValueMatch.Groups['key'].Value] = [int64] $keyValueMatch.Groups['value'].Value
+        }
+    }
+
+    if (-not $parsedCounts.ContainsKey('discontinuities') -or -not $parsedCounts.ContainsKey('rotations')) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Discontinuities = $parsedCounts['discontinuities']
+        Rotations       = $parsedCounts['rotations']
+    }
+}
+
+function ConvertTo-VpsEgressStates {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260830-ffp/D-03/D-04: parses the third egress section's
+    lines into an ordered array of {ChannelId; HasConnection; LastSendMilliseconds;
+    BytesSent}, one entry per expected channel id, IN THE EXPECTED ORDER -- or $null
+    when the section cannot be cleanly aligned to that order: a line-count mismatch, or
+    a channel-id prefix that does not match the expected id at that position. An
+    unalignable egress section is ALWAYS a $null result and NOTHING else (the caller
+    never retries or touches unit/port state because of it) -- the whole feature is
+    indicator-only (D-05), so a cosmetic parsing failure here must never degrade a
+    healthy probe.
+
+    Each line is expected to start with "<channelId> " (the New-VpsEgressRemoteCommand
+    Section printf prefix), optionally followed by "bytes_sent:<N>" and/or
+    "lastsnd:<M>" tokens -- neither present means no established socket for that
+    channel (HasConnection=$false).
+
+    .OUTPUTS
+    Array of PSCustomObject{ChannelId;HasConnection;LastSendMilliseconds;BytesSent}, or
+    $null.
+    #>
+    [CmdletBinding()]
+    [OutputType([array])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [array] $EgressLines,
+        [Parameter(Mandatory)] [string[]] $ExpectedChannelIds
+    )
+
+    if ($EgressLines.Count -ne $ExpectedChannelIds.Count) {
+        return $null
+    }
+
+    $egressStates = [System.Collections.Generic.List[object]]::new()
+    for ($channelIndex = 0; $channelIndex -lt $ExpectedChannelIds.Count; $channelIndex++) {
+        $expectedChannelId = $ExpectedChannelIds[$channelIndex]
+        $egressLine = $EgressLines[$channelIndex]
+
+        if ($egressLine -notmatch "^$([regex]::Escape($expectedChannelId))(\s|$)") {
+            return $null
+        }
+
+        $bytesSentMatch = [regex]::Match($egressLine, 'bytes_sent:(\d+)')
+        $lastSendMatch = [regex]::Match($egressLine, 'lastsnd:(\d+)')
+
+        $egressStates.Add([pscustomobject]@{
+                ChannelId            = $expectedChannelId
+                HasConnection        = $bytesSentMatch.Success -or $lastSendMatch.Success
+                LastSendMilliseconds = if ($lastSendMatch.Success) { [int64] $lastSendMatch.Groups[1].Value } else { $null }
+                BytesSent            = if ($bytesSentMatch.Success) { [int64] $bytesSentMatch.Groups[1].Value } else { $null }
+            })
+    }
+
+    return , $egressStates.ToArray()
+}
+
 function Invoke-SmoothRelayStatusCheck {
     <#
     .SYNOPSIS
@@ -521,25 +733,51 @@ function Invoke-SmoothRelayStatusCheck {
     Invoke-SmoothRelayUnitStatusCheck (260809-oc4, third round): it now ALSO parses the
     passive `ss`-derived Port section on the tcp path (-ExpectPortSection), piggybacked
     onto the SAME single SSH round trip -- see the module header for why an active TCP
-    connect against the relay port was removed entirely.
+    connect against the relay port was removed entirely. 260830-ffp extends this again
+    with an optional THIRD section (-ExpectEgressSection, D-01) carrying per-channel
+    YouTube egress observations, after a SECOND section separator.
+
+    260906-i2k extends it once more with an optional FOURTH section
+    (-ExpectReaderHealthSection, D-09) carrying the watchdog's two reader-health counters,
+    after a THIRD section separator.
 
     Combined-reply parsing (-ExpectPortSection):
-      1. Find $script:SmoothRelaySshSectionSeparator's exact line in OutputLines. Not
-         found at all -> the reply cannot be aligned (a truncated write, or something
-         mangled the ssh session) -- BOTH UnitStates and PortState resolve to unknown,
-         ShouldRetry=$true (same truncated-reply retry contract as a line-count mismatch).
-      2. Everything before the separator is the systemctl section; if its line count does
-         not match UnitNames.Count, same treatment as case 1 (ShouldRetry=$true).
-      3. Everything after the separator is the `ss` section -- ZERO OR MORE lines is a
-         perfectly valid, ALIGNED result (a quiet port genuinely prints nothing), never a
-         retry trigger by itself: any line starting with 'LISTEN' -> PortState='open'; else
-         any line starting with 'ESTAB' -> PortState='in use'; else -> PortState='closed'
-         (a REAL, observed negative -- D-09 still lets this outrank down, not merely
-         degraded).
+      1. Collect EVERY $script:SmoothRelaySshSectionSeparator line's index in
+         OutputLines, in order. None found -> the reply cannot be aligned (a truncated
+         write, or something mangled the ssh session) -- UnitStates, PortState, AND
+         EgressStates all resolve to unknown, ShouldRetry=$true (same truncated-reply
+         retry contract as a line-count mismatch).
+      2. Everything before the FIRST separator is the systemctl section; if its line
+         count does not match UnitNames.Count, same treatment as case 1
+         (ShouldRetry=$true). This is the pre-existing contract and is UNCHANGED by the
+         260830-ffp egress extension -- a malformed egress section can never widen or
+         narrow it (D-03).
+      3. Everything between the FIRST and SECOND separator (or to the end of the reply,
+         when there is no second separator) is the `ss` section -- ZERO OR MORE lines is
+         a perfectly valid, ALIGNED result (a quiet port genuinely prints nothing), never
+         a retry trigger by itself: any line starting with 'LISTEN' -> PortState='open';
+         else any line starting with 'ESTAB' -> PortState='in use'; else ->
+         PortState='closed' (a REAL, observed negative -- D-09 still lets this outrank
+         down, not merely degraded).
+      4. Only when -ExpectEgressSection was requested AND a second separator is present:
+         everything after the SECOND separator is handed to ConvertTo-VpsEgressStates
+         against the D-02-derived expected channel-id order. Per D-03, ANY alignment
+         failure here (no second separator, wrong line count, out-of-order channel-id
+         prefix) resolves EgressStates to $null and NOTHING else -- it never sets
+         ShouldRetry and never blanks UnitStates or PortState, both of which are already
+         fully resolved above by the time this step runs.
+      5. Only when -ExpectReaderHealthSection was requested AND a THIRD separator is
+         present: everything after it is handed to ConvertTo-VpsReaderHealthState. Adding
+         this third separator necessarily SHORTENS the egress slice in step 4, which
+         previously ran to end-of-reply -- when no third separator is present the egress
+         slice still runs to end-of-reply, byte-identical to before this feature. Per
+         D-10, any misalignment here resolves ReaderHealth to $null and NOTHING else: no
+         ShouldRetry, no change to unit/Port/egress state.
 
     Without -ExpectPortSection (the srt break-glass path's SSH leg, or any caller that
     passes no RelayPort), OutputLines is parsed exactly as before this redesign: no
-    separator is expected, and the whole reply must equal UnitNames.Count.
+    separator is expected, and the whole reply must equal UnitNames.Count. EgressStates
+    is always $null on this path.
 
     ShouldRetry is $true on EXACTLY the alignment-failure branches above -- the process-
     start-failure branch and the TimedOut branch both fail fast with ShouldRetry=$false:
@@ -550,8 +788,10 @@ function Invoke-SmoothRelayStatusCheck {
     .OUTPUTS
     PSCustomObject: UnitStates (ordered array of {UnitName; State}), PortState
     ('open'|'in use'|'closed'|$null -- $null only when -ExpectPortSection was never
-    requested, or the reply could not be aligned), Detail (string or $null), ShouldRetry
-    (bool).
+    requested, or the reply could not be aligned), EgressStates (ordered array of
+    {ChannelId; HasConnection; LastSendMilliseconds; BytesSent}, or $null -- see D-03
+    above), ReaderHealth ({Discontinuities; Rotations} or $null -- see D-10 above),
+    Detail (string or $null), ShouldRetry (bool).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -559,7 +799,9 @@ function Invoke-SmoothRelayStatusCheck {
         [Parameter(Mandatory)] [string[]] $SshArguments,
         [Parameter(Mandatory)] [int] $HardTimeoutMilliseconds,
         [Parameter(Mandatory)] [array] $UnitNames,
-        [bool] $ExpectPortSection = $false
+        [bool] $ExpectPortSection = $false,
+        [bool] $ExpectEgressSection = $false,
+        [bool] $ExpectReaderHealthSection = $false
     )
 
     $unitStates = [System.Collections.Generic.List[object]]::new()
@@ -570,11 +812,11 @@ function Invoke-SmoothRelayStatusCheck {
     $sshResult = Invoke-SshCommand -ArgumentList $SshArguments -HardTimeoutMilliseconds $HardTimeoutMilliseconds
 
     if ($null -ne $sshResult.Detail) {
-        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; Detail = $sshResult.Detail; ShouldRetry = $false }
+        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; EgressStates = $null; ReaderHealth = $null; Detail = $sshResult.Detail; ShouldRetry = $false }
     }
 
     if ($sshResult.TimedOut) {
-        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; Detail = 'ssh probe timed out'; ShouldRetry = $false }
+        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; EgressStates = $null; ReaderHealth = $null; Detail = 'ssh probe timed out'; ShouldRetry = $false }
     }
 
     $outputLines = $sshResult.OutputLines
@@ -582,42 +824,72 @@ function Invoke-SmoothRelayStatusCheck {
     if (-not $ExpectPortSection) {
         if ($outputLines.Count -ne $UnitNames.Count) {
             return [pscustomobject]@{
-                UnitStates  = $unitStates.ToArray()
-                PortState   = $null
-                Detail      = "systemctl is-active returned $($outputLines.Count) status line(s), expected $($UnitNames.Count) -- cannot align, treating all units unknown"
-                ShouldRetry = $true
+                UnitStates   = $unitStates.ToArray()
+                PortState    = $null
+                EgressStates = $null
+                ReaderHealth = $null
+                Detail       = "systemctl is-active returned $($outputLines.Count) status line(s), expected $($UnitNames.Count) -- cannot align, treating all units unknown"
+                ShouldRetry  = $true
             }
         }
         for ($unitIndex = 0; $unitIndex -lt $unitStates.Count; $unitIndex++) {
             $unitStates[$unitIndex].State = $outputLines[$unitIndex].Trim()
         }
-        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; Detail = $null; ShouldRetry = $false }
+        return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $null; EgressStates = $null; ReaderHealth = $null; Detail = $null; ShouldRetry = $false }
     }
 
-    $separatorIndex = [array]::IndexOf($outputLines, $script:SmoothRelaySshSectionSeparator)
-    if ($separatorIndex -lt 0) {
-        return [pscustomobject]@{
-            UnitStates  = $unitStates.ToArray()
-            PortState   = $null
-            Detail      = "ssh reply is missing the '$($script:SmoothRelaySshSectionSeparator)' section separator -- cannot align systemctl/ss output, treating all checks unknown"
-            ShouldRetry = $true
+    # 260830-ffp: collect ALL separator indices (not just the first) so a third section
+    # (egress) can be sliced out after the second separator without disturbing the
+    # first separator's existing systemctl/ss alignment contract at all (D-03).
+    $separatorIndices = [System.Collections.Generic.List[int]]::new()
+    for ($lineIndex = 0; $lineIndex -lt $outputLines.Count; $lineIndex++) {
+        if ($outputLines[$lineIndex] -eq $script:SmoothRelaySshSectionSeparator) {
+            $separatorIndices.Add($lineIndex)
         }
     }
 
-    $systemctlLines = if ($separatorIndex -gt 0) { @($outputLines[0..($separatorIndex - 1)]) } else { @() }
-    $portLines = if ($separatorIndex -lt $outputLines.Count - 1) { @($outputLines[($separatorIndex + 1)..($outputLines.Count - 1)]) } else { @() }
+    if ($separatorIndices.Count -eq 0) {
+        return [pscustomobject]@{
+            UnitStates   = $unitStates.ToArray()
+            PortState    = $null
+            EgressStates = $null
+            ReaderHealth = $null
+            Detail       = "ssh reply is missing the '$($script:SmoothRelaySshSectionSeparator)' section separator -- cannot align systemctl/ss output, treating all checks unknown"
+            ShouldRetry  = $true
+        }
+    }
+
+    $firstSeparatorIndex = $separatorIndices[0]
+    $systemctlLines = if ($firstSeparatorIndex -gt 0) { @($outputLines[0..($firstSeparatorIndex - 1)]) } else { @() }
 
     if ($systemctlLines.Count -ne $UnitNames.Count) {
         return [pscustomobject]@{
-            UnitStates  = $unitStates.ToArray()
-            PortState   = $null
-            Detail      = "systemctl is-active returned $($systemctlLines.Count) status line(s), expected $($UnitNames.Count) -- cannot align, treating all units unknown"
-            ShouldRetry = $true
+            UnitStates   = $unitStates.ToArray()
+            PortState    = $null
+            EgressStates = $null
+            ReaderHealth = $null
+            Detail       = "systemctl is-active returned $($systemctlLines.Count) status line(s), expected $($UnitNames.Count) -- cannot align, treating all units unknown"
+            ShouldRetry  = $true
         }
     }
 
     for ($unitIndex = 0; $unitIndex -lt $unitStates.Count; $unitIndex++) {
         $unitStates[$unitIndex].State = $systemctlLines[$unitIndex].Trim()
+    }
+
+    # D-03: a second separator is present only when the caller also asked for an egress
+    # section (tcp path) AND the reply actually contains one -- its ABSENCE here is not
+    # an alignment failure of the FIRST separator's own contract (unchanged above), so
+    # the port section still runs all the way to the end of the reply exactly like it
+    # did before this feature existed.
+    $secondSeparatorIndex = if ($separatorIndices.Count -ge 2) { $separatorIndices[1] } else { $null }
+
+    $portLines = if ($null -ne $secondSeparatorIndex) {
+        if ($secondSeparatorIndex -gt $firstSeparatorIndex + 1) { @($outputLines[($firstSeparatorIndex + 1)..($secondSeparatorIndex - 1)]) } else { @() }
+    } elseif ($firstSeparatorIndex -lt $outputLines.Count - 1) {
+        @($outputLines[($firstSeparatorIndex + 1)..($outputLines.Count - 1)])
+    } else {
+        @()
     }
 
     $portState = 'closed'
@@ -627,7 +899,48 @@ function Invoke-SmoothRelayStatusCheck {
         $portState = 'in use'
     }
 
-    return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $portState; Detail = $null; ShouldRetry = $false }
+    # D-03: egress resolves to $null and NOTHING else when it cannot be aligned -- no
+    # second separator, a line-count mismatch, or an out-of-order channel-id prefix.
+    # UnitStates and PortState above are already fully resolved by this point and are
+    # NEVER touched by anything below.
+    # 260906-i2k/D-09: the THIRD separator, when present, BOUNDS the egress slice below --
+    # which before this feature always ran to end-of-reply. Its ABSENCE is not an
+    # alignment failure of anything: the egress slice then runs to end-of-reply exactly
+    # as it did, byte-identical, so a VPS running a pre-260906-i2k watchdog (or none at
+    # all) parses precisely as before.
+    $thirdSeparatorIndex = if ($separatorIndices.Count -ge 3) { $separatorIndices[2] } else { $null }
+
+    # Both slices below are built by DIRECT ASSIGNMENT of `@()` first, then conditionally
+    # overwritten -- never as `$x = if (...) {...} else { @() }`. PowerShell unrolls an
+    # empty array returned from an if-expression into $null, which then fails the
+    # [array]-typed Mandatory parameter binding on the converters. Caught live by this
+    # change's own "empty reader-health section" test (260906-i2k).
+    $egressStates = $null
+    if ($ExpectEgressSection -and $null -ne $secondSeparatorIndex) {
+        $egressSliceEndIndex = if ($null -ne $thirdSeparatorIndex) { $thirdSeparatorIndex - 1 } else { $outputLines.Count - 1 }
+        $egressLines = @()
+        if ($egressSliceEndIndex -ge $secondSeparatorIndex + 1) {
+            $egressLines = @($outputLines[($secondSeparatorIndex + 1)..$egressSliceEndIndex])
+        }
+        $egressStates = ConvertTo-VpsEgressStates -EgressLines $egressLines -ExpectedChannelIds (Get-VpsEgressChannelIds)
+    }
+
+    # D-10: reader health resolves to $null and NOTHING else on ANY misalignment -- no
+    # third separator, a missing key, a non-integer value, or an absent remote file
+    # (zero lines). UnitStates, PortState and EgressStates above are already fully
+    # resolved by this point and are NEVER touched by anything below, and ShouldRetry is
+    # never set from here: the two rows this feeds are indicator-only, and a genuinely
+    # dead reader already surfaces on its own unit row.
+    $readerHealth = $null
+    if ($ExpectReaderHealthSection -and $null -ne $thirdSeparatorIndex) {
+        $readerHealthLines = @()
+        if ($thirdSeparatorIndex -lt $outputLines.Count - 1) {
+            $readerHealthLines = @($outputLines[($thirdSeparatorIndex + 1)..($outputLines.Count - 1)])
+        }
+        $readerHealth = ConvertTo-VpsReaderHealthState -ReaderHealthLines $readerHealthLines
+    }
+
+    return [pscustomobject]@{ UnitStates = $unitStates.ToArray(); PortState = $portState; EgressStates = $egressStates; ReaderHealth = $readerHealth; Detail = $null; ShouldRetry = $false }
 }
 
 function Test-SmoothRelayHealth {
@@ -659,14 +972,16 @@ function Test-SmoothRelayHealth {
     table, it never touches the relay port itself). -o BatchMode=yes means a probe
     running unattended fails fast rather than hanging on an interactive prompt.
 
-    When RelayPort -gt 0, the remote command becomes THREE `;`-chained sections:
-    `systemctl is-active <unit1> <unit2> <unit3>`, then `echo ---` (the exact
-    $script:SmoothRelaySshSectionSeparator literal), then
-    `ss -Htan '( sport = :<RelayPort> )'` -- see Invoke-SmoothRelayStatusCheck for the
-    alignment-safe parsing contract this produces. When RelayPort is 0 or omitted (the
-    srt break-glass path's SSH leg), the remote command is UNCHANGED from before this
-    redesign: plain `systemctl is-active <unit1> <unit2> <unit3>`, no separator, no `ss`
-    (a TCP-only `ss` query against the srt path's UDP port would be meaningless).
+    When RelayPort -gt 0, the remote command becomes FIVE `;`-chained sections
+    (260830-ffp adds the last two): `systemctl is-active <unit1> <unit2> <unit3>`, then
+    `echo ---` (the exact $script:SmoothRelaySshSectionSeparator literal), then
+    `ss -Htan '( sport = :<RelayPort> )'`, then a SECOND `echo ---`, then the D-01/D-02
+    egress loop built by New-VpsEgressRemoteCommandSection over Get-VpsEgressChannelIds'
+    derived channel ids -- see Invoke-SmoothRelayStatusCheck for the alignment-safe
+    parsing contract this produces. When RelayPort is 0 or omitted (the srt break-glass
+    path's SSH leg), the remote command is UNCHANGED from before this redesign: plain
+    `systemctl is-active <unit1> <unit2> <unit3>`, no separator, no `ss`, no egress loop
+    (a TCP-only `ss`/egress query against the srt path's UDP port would be meaningless).
 
     `systemctl is-active <unit1> <unit2> <unit3>` prints exactly one status line per
     requested unit, IN REQUEST ORDER (the documented systemctl contract this leg relies
@@ -683,7 +998,10 @@ function Test-SmoothRelayHealth {
     'active'/'inactive'/etc. as reported by systemd, or $null meaning genuinely unknown,
     e.g. a timeout or an unparseable response, never a fabricated 'inactive'), PortState
     ('open'|'in use'|'closed'|$null -- $null when RelayPort was 0/omitted, or the reply
-    could not be aligned), Detail (string or $null).
+    could not be aligned), EgressStates (260830-ffp: ordered array of {ChannelId;
+    HasConnection; LastSendMilliseconds; BytesSent}, or $null when RelayPort was
+    0/omitted, or the egress section could not be aligned -- D-03), Detail (string or
+    $null).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -704,6 +1022,17 @@ function Test-SmoothRelayHealth {
     if ($includesPortCheck) {
         $remoteCommandSections.Add("echo $script:SmoothRelaySshSectionSeparator")
         $remoteCommandSections.Add("ss -Htan '( sport = :$RelayPort )'")
+        # 260830-ffp/D-01: the egress section is appended ONLY on the tcp path, as a
+        # THIRD section after a SECOND separator -- the srt break-glass path's remote
+        # command (the 'else' branch, i.e. $includesPortCheck stays $false) is
+        # byte-identical to today's.
+        $remoteCommandSections.Add("echo $script:SmoothRelaySshSectionSeparator")
+        $remoteCommandSections.Add((New-VpsEgressRemoteCommandSection -ChannelIds (Get-VpsEgressChannelIds)))
+        # 260906-i2k/D-09: the reader-health section, likewise tcp-path only, as a FOURTH
+        # section after a THIRD separator. The srt break-glass path's remote command
+        # (this whole branch skipped) stays byte-identical to today's.
+        $remoteCommandSections.Add("echo $script:SmoothRelaySshSectionSeparator")
+        $remoteCommandSections.Add((New-VpsReaderHealthRemoteCommandSection))
     }
 
     $sshArguments = @(
@@ -718,14 +1047,18 @@ function Test-SmoothRelayHealth {
     )
 
     $checkResult = Invoke-SmoothRelayStatusCheck -SshArguments $sshArguments `
-        -HardTimeoutMilliseconds $HardTimeoutMilliseconds -UnitNames $script:SmoothRelayUnitNames -ExpectPortSection $includesPortCheck
+        -HardTimeoutMilliseconds $HardTimeoutMilliseconds -UnitNames $script:SmoothRelayUnitNames `
+        -ExpectPortSection $includesPortCheck -ExpectEgressSection $includesPortCheck `
+        -ExpectReaderHealthSection $includesPortCheck
 
     if ($checkResult.ShouldRetry) {
         $checkResult = Invoke-SmoothRelayStatusCheck -SshArguments $sshArguments `
-            -HardTimeoutMilliseconds $HardTimeoutMilliseconds -UnitNames $script:SmoothRelayUnitNames -ExpectPortSection $includesPortCheck
+            -HardTimeoutMilliseconds $HardTimeoutMilliseconds -UnitNames $script:SmoothRelayUnitNames `
+            -ExpectPortSection $includesPortCheck -ExpectEgressSection $includesPortCheck `
+            -ExpectReaderHealthSection $includesPortCheck
     }
 
-    return [pscustomobject]@{ UnitStates = $checkResult.UnitStates; PortState = $checkResult.PortState; Detail = $checkResult.Detail }
+    return [pscustomobject]@{ UnitStates = $checkResult.UnitStates; PortState = $checkResult.PortState; EgressStates = $checkResult.EgressStates; ReaderHealth = $checkResult.ReaderHealth; Detail = $checkResult.Detail }
 }
 
 function Get-SshLegCacheFilePath {
@@ -833,15 +1166,23 @@ function Read-SshLegCache {
 function Save-SshLegCache {
     <#
     .SYNOPSIS
-    Private (never exported), 260809-oc4 (extended third round for PortState): writes the
-    SSH-leg cache payload (schemaVersion, the monotonic moment it was observed, the
-    unit-name set it was captured with -- so a future rename can never be resurrected
-    under the wrong names -- the observed unit/state pairs, the observed Port state, and
-    Detail) to CacheFilePath. The whole body is wrapped so ANY write failure (permissions,
-    disk full, a concurrent delete of the parent directory) is swallowed rather than
-    thrown: the SSH-leg cache is a best-effort optimization, never a correctness
-    dependency, so the next poll simply re-runs the SSH leg unthrottled instead of the
-    probe crashing.
+    Private (never exported), 260809-oc4 (extended third round for PortState; extended
+    260830-ffp for EgressStates, D-06): writes the SSH-leg cache payload (schemaVersion,
+    the monotonic moment it was observed, the unit-name set it was captured with -- so a
+    future rename can never be resurrected under the wrong names -- the observed
+    unit/state pairs, the observed Port state, the observed per-channel egress states,
+    and Detail) to CacheFilePath. The whole body is wrapped so ANY write failure
+    (permissions, disk full, a concurrent delete of the parent directory) is swallowed
+    rather than thrown: the SSH-leg cache is a best-effort optimization, never a
+    correctness dependency, so the next poll simply re-runs the SSH leg unthrottled
+    instead of the probe crashing.
+
+    A $null EgressStates is written as JSON null, NEVER as an empty array (D-06) -- an
+    empty array on read-back would mean "aligned, zero channels", a fabricated fact this
+    module must never claim. 260906-i2k/D-11 adds readerHealth on the same terms: a $null
+    ReaderHealth is written as JSON null, never as a fabricated zero pair -- "the watchdog
+    has not published counters" and "the watchdog published two zeroes" are different
+    facts, and only the second one may render as an 'ok' row.
 
     .OUTPUTS
     None.
@@ -852,6 +1193,8 @@ function Save-SshLegCache {
         [Parameter(Mandatory)] [double] $ObservedAtMonotonicSeconds,
         [Parameter(Mandatory)] [array] $UnitStates,
         [AllowNull()] [string] $PortState,
+        [AllowNull()] [array] $EgressStates,
+        [AllowNull()] $ReaderHealth,
         [string] $Detail
     )
 
@@ -861,12 +1204,36 @@ function Save-SshLegCache {
             New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
         }
 
+        $egressStatesForCache = if ($null -eq $EgressStates) {
+            $null
+        } else {
+            @($EgressStates | ForEach-Object {
+                    [ordered]@{
+                        channelId            = $_.ChannelId
+                        hasConnection        = $_.HasConnection
+                        lastSendMilliseconds = $_.LastSendMilliseconds
+                        bytesSent            = $_.BytesSent
+                    }
+                })
+        }
+
+        $readerHealthForCache = if ($null -eq $ReaderHealth) {
+            $null
+        } else {
+            [ordered]@{
+                discontinuities = $ReaderHealth.Discontinuities
+                rotations       = $ReaderHealth.Rotations
+            }
+        }
+
         $cachePayloadObject = [ordered]@{
             schemaVersion              = $script:SshLegCacheSchemaVersion
             observedAtMonotonicSeconds = $ObservedAtMonotonicSeconds
             unitNames                  = @($script:SmoothRelayUnitNames)
             unitStates                 = @($UnitStates | ForEach-Object { [ordered]@{ unitName = $_.UnitName; state = $_.State } })
             portState                  = $PortState
+            egressStates               = $egressStatesForCache
+            readerHealth               = $readerHealthForCache
             detail                     = $Detail
         }
         $cachePayload = $cachePayloadObject | ConvertTo-Json -Compress -Depth 4
@@ -905,8 +1272,11 @@ function Get-ThrottledSmoothRelayUnitStates {
     SSH outage from silently restoring the old hot per-poll cadence (T-oc4-04).
 
     .OUTPUTS
-    PSCustomObject: UnitStates, PortState ('open'|'in use'|'closed'|$null), Detail,
-    ObservedAgeSeconds (double, seconds, or $null when this call ran the SSH leg fresh).
+    PSCustomObject: UnitStates, PortState ('open'|'in use'|'closed'|$null), EgressStates
+    (260830-ffp: ordered array of {ChannelId; HasConnection; LastSendMilliseconds;
+    BytesSent}, or $null -- D-03/D-06), ReaderHealth (260906-i2k: {Discontinuities;
+    Rotations} or $null -- D-10/D-11), Detail, ObservedAgeSeconds (double, seconds, or
+    $null when this call ran the SSH leg fresh).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -926,9 +1296,38 @@ function Get-ThrottledSmoothRelayUnitStates {
                         [pscustomobject]@{ UnitName = $_.unitName; State = $_.state }
                     })
                 $cachedPortState = if ($cachedPayload.PSObject.Properties.Name -contains 'portState') { $cachedPayload.portState } else { $null }
+                # 260830-ffp/D-06: the SAME property-existence guard the portState
+                # restore above already uses (StrictMode-safe against an older-shaped
+                # payload), PLUS an explicit null guard -- a null egressStates value
+                # restores as $null, never as an empty array (an empty array would mean
+                # "aligned, zero channels", a fabricated fact).
+                $cachedEgressStates = $null
+                if (($cachedPayload.PSObject.Properties.Name -contains 'egressStates') -and ($null -ne $cachedPayload.egressStates)) {
+                    $cachedEgressStates = @($cachedPayload.egressStates | ForEach-Object {
+                            [pscustomobject]@{
+                                ChannelId            = $_.channelId
+                                HasConnection        = $_.hasConnection
+                                LastSendMilliseconds = $_.lastSendMilliseconds
+                                BytesSent            = $_.bytesSent
+                            }
+                        })
+                }
+                # 260906-i2k/D-11: same property-existence-plus-null guard as the
+                # egressStates restore above. A null readerHealth restores as $null
+                # (rows read 'unknown'), never as a fabricated {0;0} pair, which would
+                # render two reassuring 'ok' rows for a watchdog that never reported.
+                $cachedReaderHealth = $null
+                if (($cachedPayload.PSObject.Properties.Name -contains 'readerHealth') -and ($null -ne $cachedPayload.readerHealth)) {
+                    $cachedReaderHealth = [pscustomobject]@{
+                        Discontinuities = $cachedPayload.readerHealth.discontinuities
+                        Rotations       = $cachedPayload.readerHealth.rotations
+                    }
+                }
                 return [pscustomobject]@{
                     UnitStates         = $cachedUnitStates
                     PortState          = $cachedPortState
+                    EgressStates       = $cachedEgressStates
+                    ReaderHealth       = $cachedReaderHealth
                     Detail             = $cachedPayload.detail
                     ObservedAgeSeconds = $observedAgeSeconds
                 }
@@ -939,14 +1338,27 @@ function Get-ThrottledSmoothRelayUnitStates {
     $freshResult = Test-SmoothRelayHealth -SshHost $Config.ProbeVpsSshHost -SshUser $Config.ProbeVpsSshUser `
         -SshKeyPath $Config.ProbeVpsSshKeyPath -SshPort $Config.ProbeVpsSshPort -RelayPort $RelayPort
 
+    # 260830-ffp: a property-existence guard against $freshResult (StrictMode-safe) --
+    # many existing test fixtures mock Test-SmoothRelayHealth with a pscustomobject that
+    # predates EgressStates entirely; treating an absent property as $null (unresolved)
+    # rather than a StrictMode error keeps every such fixture's existing behavior intact.
+    $freshEgressStates = if ($freshResult.PSObject.Properties.Name -contains 'EgressStates') { $freshResult.EgressStates } else { $null }
+    # 260906-i2k: the SAME StrictMode-safe guard, for the same reason -- existing test
+    # fixtures mock Test-SmoothRelayHealth with objects that predate ReaderHealth, and an
+    # absent property must read as "unresolved", never as a StrictMode error.
+    $freshReaderHealth = if ($freshResult.PSObject.Properties.Name -contains 'ReaderHealth') { $freshResult.ReaderHealth } else { $null }
+
     if ($null -ne $cacheFilePath) {
         Save-SshLegCache -CacheFilePath $cacheFilePath -ObservedAtMonotonicSeconds (Get-MonotonicSeconds) `
-            -UnitStates $freshResult.UnitStates -PortState $freshResult.PortState -Detail $freshResult.Detail
+            -UnitStates $freshResult.UnitStates -PortState $freshResult.PortState -EgressStates $freshEgressStates `
+            -ReaderHealth $freshReaderHealth -Detail $freshResult.Detail
     }
 
     return [pscustomobject]@{
         UnitStates         = $freshResult.UnitStates
         PortState          = $freshResult.PortState
+        EgressStates       = $freshEgressStates
+        ReaderHealth       = $freshReaderHealth
         Detail             = $freshResult.Detail
         ObservedAgeSeconds = $null
     }
@@ -981,6 +1393,125 @@ function Add-SshLegObservationAgeNote {
         return $observationAgeNote
     }
     return "$Detail -- $observationAgeNote"
+}
+
+function Resolve-VpsEgressRowValue {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260830-ffp/D-04: pure resolver for one egress channel's
+    metric row VALUE, in this exact order (never reordered -- each earlier branch
+    outranks every later one): srt path -> 'not applicable'; SSH leg not configured ->
+    'not configured'; ssh.exe absent, egress unresolved, or no observation for this
+    channel -> 'unknown'; no established socket for the channel -> 'no connection';
+    lastsnd absent -> 'unknown'; lastsnd below $script:VpsEgressStalledThresholdMilliseconds
+    -> 'sending'; otherwise -> 'stalled Ns' (whole seconds, floored). Takes plain values
+    only, never the Config object, so it stays directly unit-testable (D-04).
+
+    .OUTPUTS
+    String.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [bool] $IsTcpPath,
+        [Parameter(Mandatory)] [bool] $SshConfigured,
+        [Parameter(Mandatory)] [bool] $SshExecutableAvailable,
+        [AllowNull()] $EgressState
+    )
+
+    if (-not $IsTcpPath) {
+        return 'not applicable'
+    }
+    if (-not $SshConfigured) {
+        return 'not configured'
+    }
+    if ((-not $SshExecutableAvailable) -or ($null -eq $EgressState)) {
+        return 'unknown'
+    }
+    if (-not $EgressState.HasConnection) {
+        return 'no connection'
+    }
+    if ($null -eq $EgressState.LastSendMilliseconds) {
+        return 'unknown'
+    }
+    if ($EgressState.LastSendMilliseconds -lt $script:VpsEgressStalledThresholdMilliseconds) {
+        return 'sending'
+    }
+    return "stalled $([math]::Floor($EgressState.LastSendMilliseconds / 1000))s"
+}
+
+function Resolve-VpsReaderHealthRowValue {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260906-i2k/D-11: pure resolver for ONE reader-health row's
+    VALUE, in this exact order (never reordered -- each earlier branch outranks every
+    later one): srt path -> 'not applicable'; SSH leg not configured -> 'not configured';
+    ssh.exe absent or the reader-health state unresolved -> 'unknown'; count of zero ->
+    'ok'; any count above zero -> 'warn'. Takes plain values only (never the Config
+    object, never the whole state), so it stays directly unit-testable -- same shape and
+    same rationale as Resolve-VpsEgressRowValue.
+
+    'warn' rather than a number is deliberate: the COUNT belongs in the row's unit field,
+    where Invoke-Probe puts it. The value field is a fixed vocabulary the dashboard maps
+    to a status dot, and nothing from the remote payload is ever rendered into it
+    verbatim (T-i2k-01).
+
+    .OUTPUTS
+    String.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [bool] $IsTcpPath,
+        [Parameter(Mandatory)] [bool] $SshConfigured,
+        [Parameter(Mandatory)] [bool] $SshExecutableAvailable,
+        [AllowNull()] $Count
+    )
+
+    if (-not $IsTcpPath) {
+        return 'not applicable'
+    }
+    if (-not $SshConfigured) {
+        return 'not configured'
+    }
+    if ((-not $SshExecutableAvailable) -or ($null -eq $Count)) {
+        return 'unknown'
+    }
+    if ($Count -eq 0) {
+        return 'ok'
+    }
+    return 'warn'
+}
+
+function Format-VpsEgressByteTotal {
+    <#
+    .SYNOPSIS
+    Private (never exported), 260830-ffp/D-04: pure byte-total formatter for the egress
+    row's `unit` field -- whole MB below 1 GB, one-decimal GB at or above 1 GB, ALWAYS
+    rendered via [cultureinfo]::InvariantCulture so a non-English church PC locale can
+    never format the decimal point as a comma (D-07: ASCII only, no locale surprises).
+    $null (no byte total known) formats as '' -- never a fabricated zero.
+
+    .OUTPUTS
+    String.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()] $BytesSent
+    )
+
+    if ($null -eq $BytesSent) {
+        return ''
+    }
+
+    if ($BytesSent -ge 1GB) {
+        $gigabytes = [double] $BytesSent / 1GB
+        return "$($gigabytes.ToString('0.0', [cultureinfo]::InvariantCulture)) GB"
+    }
+
+    $megabytes = [math]::Round([double] $BytesSent / 1MB)
+    return "$($megabytes.ToString([cultureinfo]::InvariantCulture)) MB"
 }
 
 function New-VpsProbeResult {
@@ -1056,7 +1587,13 @@ function Invoke-Probe {
     there is no more active connect -- YAGNI, this was never one of the five fixed rows)
     is built UNCONDITIONALLY, from whatever each leg returned, BEFORE the status decision
     above runs. Every return path -- including the 'down' path -- carries all five rows,
-    so the dashboard never has to hide a check row depending on status.
+    so the dashboard never has to hide a check row depending on status. 260830-ffp appends
+    TWO MORE rows after those, unconditionally on every path and every status: 'YT LV out'
+    and 'YT RU out' (D-02's derived channel ids), each resolved per D-04 from the SAME SSH
+    round trip's egress section. These two rows are INDICATOR-ONLY -- see D-05 at their
+    build site below -- they never influence the status fold and the dashboard renderer
+    needs no schema change to display them (plain {label,value,unit} rows, same as every
+    other metric).
 
     .OUTPUTS
     PSCustomObject: name, title, status ('ok'|'degraded'|'down'|'unknown'), metrics
@@ -1105,12 +1642,16 @@ function Invoke-Probe {
     $sshExecutableAvailable = $sshConfigured -and [bool] (Get-Command 'ssh.exe' -ErrorAction SilentlyContinue)
     $unitsResult = $null
     $tcpPortState = $null
+    $egressStates = $null
+    $readerHealth = $null
     $sshLegObservedAgeSeconds = $null
     if ($sshExecutableAvailable) {
         $sshLegRelayPort = if ($isTcpPath) { $Config.RelayPort } else { 0 }
         $throttledResult = Get-ThrottledSmoothRelayUnitStates -Config $Config -RelayPort $sshLegRelayPort
         $unitsResult = [pscustomobject]@{ UnitStates = $throttledResult.UnitStates; Detail = $throttledResult.Detail }
         $tcpPortState = $throttledResult.PortState
+        $egressStates = $throttledResult.EgressStates
+        $readerHealth = $throttledResult.ReaderHealth
         $sshLegObservedAgeSeconds = $throttledResult.ObservedAgeSeconds
     }
 
@@ -1161,6 +1702,39 @@ function Invoke-Probe {
         if ($null -ne $reachability.LatencyMilliseconds) {
             $metrics.Add(@{ label = 'Latency'; value = [math]::Round($reachability.LatencyMilliseconds, 2); unit = 'ms' })
         }
+    }
+
+    # 260830-ffp/D-05: two egress indicator rows, appended after EVERY existing row on
+    # both paths ('YT LV out' / 'YT RU out'). These are INDICATOR-ONLY -- they never
+    # feed the D-09 fold below (no new branch, no changed condition anywhere in that
+    # fold) because (a) YAGNI: a genuinely dead reader unit already surfaces through its
+    # own row and the existing degraded branch, and (b) the sample can be up to 60s old
+    # (the SSH-leg throttle), so folding it would raise false alarms from stale evidence
+    # during a normal catch-up burst.
+    foreach ($egressChannelId in (Get-VpsEgressChannelIds)) {
+        $matchingEgressState = if ($null -ne $egressStates) { $egressStates | Where-Object { $_.ChannelId -eq $egressChannelId } } else { $null }
+        $egressRowValue = Resolve-VpsEgressRowValue -IsTcpPath $isTcpPath -SshConfigured $sshConfigured `
+            -SshExecutableAvailable $sshExecutableAvailable -EgressState $matchingEgressState
+        $egressRowUnit = if ($null -ne $matchingEgressState) { Format-VpsEgressByteTotal -BytesSent $matchingEgressState.BytesSent } else { '' }
+        $metrics.Add(@{ label = "YT $($egressChannelId.ToUpperInvariant()) out"; value = $egressRowValue; unit = $egressRowUnit })
+    }
+
+    # 260906-i2k/D-10/D-11: two reader-health indicator rows, appended AFTER the egress
+    # rows, 'Rotations' first then 'Discontinuities'. Like the egress rows they never
+    # enter the D-09 fold below -- no new branch, no changed condition anywhere in it --
+    # for the same two reasons: a genuinely dead reader already surfaces through its own
+    # unit row and the existing degraded branch, and the sample can be up to 60s stale
+    # (the SSH-leg throttle), so folding it would raise false alarms from old evidence.
+    # The count rides in the row's unit field as an invariant-culture string, or '' when
+    # the state is unresolved -- never a fabricated zero.
+    foreach ($readerHealthRow in @(
+            @{ Label = 'Rotations'; PropertyName = 'Rotations' },
+            @{ Label = 'Discontinuities'; PropertyName = 'Discontinuities' })) {
+        $readerHealthCount = if ($null -ne $readerHealth) { $readerHealth.($readerHealthRow.PropertyName) } else { $null }
+        $readerHealthRowValue = Resolve-VpsReaderHealthRowValue -IsTcpPath $isTcpPath -SshConfigured $sshConfigured `
+            -SshExecutableAvailable $sshExecutableAvailable -Count $readerHealthCount
+        $readerHealthRowUnit = if ($null -ne $readerHealthCount) { ([int64] $readerHealthCount).ToString([cultureinfo]::InvariantCulture) } else { '' }
+        $metrics.Add(@{ label = $readerHealthRow.Label; value = $readerHealthRowValue; unit = $readerHealthRowUnit })
     }
 
     $metricsArray = $metrics.ToArray()

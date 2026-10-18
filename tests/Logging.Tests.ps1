@@ -202,3 +202,103 @@ Describe 'Write-Log log rotation' -Tag 'Quick' {
         $script:moveAttemptCount | Should -BeGreaterThan 1
     }
 }
+
+# 261018: Write-Log runs on the supervisor's main thread under $ErrorActionPreference =
+# 'Stop'. A log-file I/O failure (AV/indexer lock, a torn rotation, disk full) used to
+# throw out of Write-Log and end the supervisor with no log line -- the silent-death
+# signature of 2026-10-04. File I/O in Write-Log is now best-effort and never throws;
+# the console/error-stream emit still happens so the line is not lost entirely.
+Describe 'Write-Log never throws on log-file I/O (261018)' -Tag 'Quick' {
+
+    BeforeEach {
+        Push-Location $TestDrive
+        Remove-Module Logging -ErrorAction SilentlyContinue
+        Import-Module $script:ModulePath -Force
+        Set-LogDirectory (Join-Path $TestDrive 'state/logs')
+    }
+
+    AfterEach {
+        Remove-Module Logging -ErrorAction SilentlyContinue
+        Pop-Location
+    }
+
+    It 'does not throw at Info when Add-Content throws an IOException, and still emits to the console' {
+        Mock -ModuleName Logging Add-Content { throw [System.IO.IOException]::new('locked') }
+        Mock -ModuleName Logging Write-Host { }
+
+        { Write-Log -Level Info -Message 'log file is locked' } | Should -Not -Throw
+
+        Should -Invoke -ModuleName Logging Write-Host -Times 1 -Exactly
+    }
+
+    It 'does not throw at Error under ErrorActionPreference Stop when Add-Content throws an IOException' {
+        Mock -ModuleName Logging Add-Content { throw [System.IO.IOException]::new('locked') }
+
+        $ErrorActionPreference = 'Stop'
+
+        { Write-Log -Level Error -Message 'log file is locked' -ErrorAction Stop 2>$null } | Should -Not -Throw
+    }
+
+    It 'still appends the line when rotation fails (rotation and append are independent best-effort steps)' {
+        Set-LogRotationPolicy -MaxSizeBytes 10 -RetentionCount 2
+        Write-Log -Level Info -Message 'seed line to push the active log well over the tiny cap'
+        Mock -ModuleName Logging Move-Item { throw [System.IO.IOException]::new('rotation locked') }
+        Mock -ModuleName Logging Start-Sleep { }
+
+        Write-Log -Level Info -Message 'appended despite a failed rotation'
+
+        Get-Content -LiteralPath (Get-LogFilePath) -Raw | Should -BeLike '*appended despite a failed rotation*'
+    }
+
+    It 'does not throw when every rotation Move-Item fails' {
+        Set-LogRotationPolicy -MaxSizeBytes 10 -RetentionCount 2
+        Write-Log -Level Info -Message 'seed line to push the active log well over the tiny cap'
+        Mock -ModuleName Logging Move-Item { throw [System.IO.IOException]::new('rotation locked') }
+        Mock -ModuleName Logging Start-Sleep { }
+
+        { Write-Log -Level Info -Message 'trigger rotation against a permanently locked chain' } | Should -Not -Throw
+    }
+}
+
+Describe 'Get-ProcessIdentityLogText (261018)' -Tag 'Quick' {
+
+    BeforeEach {
+        Push-Location $TestDrive
+        Remove-Module Logging -ErrorAction SilentlyContinue
+        Import-Module $script:ModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module Logging -ErrorAction SilentlyContinue
+        Pop-Location
+    }
+
+    It 'names the pid, ppid, user, session and start time of this process' {
+        $identityText = Get-ProcessIdentityLogText
+
+        $identityText | Should -BeLike "*pid=$PID*"
+        $identityText | Should -BeLike '*ppid=*'
+        $identityText | Should -BeLike '*user=*'
+        $identityText | Should -BeLike '*session=*'
+        $identityText | Should -BeLike '*started=*'
+    }
+
+    It 'falls back to exactly the pid and does not throw when the process lookup fails' {
+        Mock -ModuleName Logging Get-Process { throw 'simulated process lookup failure' }
+
+        $identityText = Get-ProcessIdentityLogText
+
+        $identityText | Should -Be "pid=$PID"
+    }
+
+    It 'renders an unreadable parent process as ppid=unknown, never ppid=none' {
+        Mock -ModuleName Logging Get-Process {
+            [pscustomobject]@{ Parent = $null; SessionId = 0; StartTime = [datetime]::Now }
+        }
+
+        $identityText = Get-ProcessIdentityLogText
+
+        $identityText | Should -BeLike '*ppid=unknown*'
+        $identityText | Should -Not -BeLike '*ppid=none*'
+    }
+}

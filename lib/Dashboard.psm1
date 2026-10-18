@@ -1357,12 +1357,13 @@ function Invoke-DashboardListenerLoop {
     .SYNOPSIS
     Blocking accept loop: calls Listener.GetContext() and dispatches each request to
     Invoke-DashboardRequestHandler. Runspace-hosted per 05-01's HOST DECISION
-    (05-SPIKE-FINDINGS.md) -- Invoke-Supervisor's tick loop does not tick while a
-    pusher is streaming (blocked inside its own WaitForExit()), which is exactly the
-    window the dashboard matters most, so this loop gets its OWN execution context
-    (05-09 hosts it in a runspace) and may use the simple blocking .GetContext() call
-    rather than RESEARCH.md Pattern 1's bounded-wait Task.WaitAny interleave -- there
-    is nothing on this thread to starve.
+    (05-SPIKE-FINDINGS.md) -- the supervisor's main thread spends a pusher run inside
+    Wait-PusherProcessExit (supervisor.ps1), waiting on the pusher in 1 s polls with
+    dashboard maintenance between them; a blocking GetContext() there would stop it
+    reacting to the pusher's exit, and a 1 s cadence would delay every request. So this
+    loop gets its OWN execution context (05-09 hosts it in a runspace) and may use the
+    simple blocking .GetContext() call rather than RESEARCH.md Pattern 1's bounded-wait
+    Task.WaitAny interleave -- there is nothing on this thread to starve.
 
     -MaxRequests bounds the loop for tests (mirrors Invoke-Supervisor's -MaxTicks seam
     exactly, same reason, same default); 0 (default) means unbounded, the production

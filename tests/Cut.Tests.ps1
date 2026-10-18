@@ -25,6 +25,9 @@
 # correctness claim, so asserting it against a mocked flag would assert nothing.
 
 BeforeAll {
+    # New-FakePusherProcess: Start-PusherProcess is spawn-only (261018), so the
+    # mocks below return a fake process and the real Wait-PusherProcessExit reads it.
+    Import-Module (Join-Path $PSScriptRoot 'TestHelpers.psm1') -Force
     $script:CutScriptPath = Join-Path $PSScriptRoot '../cut.ps1'
     $script:SupervisorScriptPath = Join-Path $PSScriptRoot '../supervisor.ps1'
     $script:ControlFlagModulePath = Join-Path $PSScriptRoot '../lib/ControlFlag.psm1'
@@ -205,7 +208,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
             Mock Start-PusherProcess {
                 Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'stopped'
-                return 1
+                return (New-FakePusherProcess -ExitCode 1)
             }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 10
@@ -217,7 +220,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
             Mock Start-PusherProcess {
                 Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'stopped'
-                return 1
+                return (New-FakePusherProcess -ExitCode 1)
             }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 10
@@ -230,7 +233,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             # relaunch" were implemented by simply never relaunching, this fails.
             # Crash restart is the entire reason supervisor.ps1 exists.
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
-            Mock Start-PusherProcess { 1 }
+            Mock Start-PusherProcess { New-FakePusherProcess -ExitCode 1 }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 3
 
@@ -248,7 +251,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
             Mock Start-PusherProcess {
                 Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'stopped'
-                return 1
+                return (New-FakePusherProcess -ExitCode 1)
             }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 10
@@ -263,7 +266,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             # The positive control that keeps the test above honest: deleting the log
             # line entirely would satisfy that test and fail this one. Both must hold.
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
-            Mock Start-PusherProcess { 1 }
+            Mock Start-PusherProcess { New-FakePusherProcess -ExitCode 1 }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 3
 
@@ -286,7 +289,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
             Mock Start-PusherProcess {
                 Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'stopped'
-                return 1
+                return (New-FakePusherProcess -ExitCode 1)
             }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 10
@@ -311,7 +314,7 @@ Describe 'supervisor.ps1 after a cut' -Tag 'Quick' {
             # will actually happen. Carried in the exit reason instead, it is emitted
             # before anything has decided, which is precisely the defect.
             Set-PusherDesiredState -ControlFilePath $script:ControlFilePath -DesiredState 'streaming'
-            Mock Start-PusherProcess { 1 }
+            Mock Start-PusherProcess { New-FakePusherProcess -ExitCode 1 }
 
             Invoke-Supervisor -ControlFilePath $script:ControlFilePath -ScriptRoot $script:SupervisorTestRoot -MaxTicks 3
 

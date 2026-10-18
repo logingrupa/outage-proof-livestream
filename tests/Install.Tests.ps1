@@ -1,6 +1,10 @@
 # Install.Tests.ps1
 # Unit tests for install.ps1 (SVC-01, SVC-02) -- Test-InstallPrerequisites,
-# Register-PusherScheduledTask, Initialize-PusherEnvFile. install.ps1 is a
+# Get-OperatorAccountProblem, ConvertTo-WallClockStartBoundary,
+# Register-SupervisorScheduledTask (the 'GaplessSupervisor' S4U operator task),
+# Remove-LegacySupervisorScheduledTask (retires the legacy 'GaplessSrtPusher'
+# SYSTEM task only after a successful registration), Register-TunnelScheduledTask,
+# Invoke-Install, Initialize-PusherEnvFile. install.ps1 is a
 # top-level script, not a module (04-PATTERNS.md), so it is dot-sourced here
 # (never invoked directly) so its functions are mockable via plain `Mock` in
 # this file's own scope -- the `if ($MyInvocation.InvocationName -ne '.')`
@@ -22,10 +26,29 @@ Describe 'install.ps1' -Tag 'Quick' {
         Push-Location $TestDrive
         Remove-Module Logging -ErrorAction SilentlyContinue
         Import-Module $script:LoggingModulePath -Force
-        Set-LogDirectory (Join-Path $TestDrive 'state/logs')
 
         # Dot-source (not `&`) so install.ps1's functions land in THIS scope.
         . $script:InstallScriptPath
+
+        # AFTER the dot-source on purpose: install.ps1 runs `Import-Module lib/Logging.psm1
+        # -Force`, which resets the log directory to the checkout's real state/logs. Set
+        # before it, an unmocked Write-Log would append to the real pusher.log.
+        Set-LogDirectory (Join-Path $TestDrive 'state/logs')
+
+        # Read-only on a real machine, but a mock keeps every test off the live task list.
+        Mock Get-ScheduledTaskInfo { $null }
+
+        # Fail-closed defaults (D-10): a test that reaches a MUTATING Scheduled
+        # Task cmdlet without mocking it must fail loudly instead of touching the
+        # machine's real tasks. Context- and It-level mocks defined later override
+        # these.
+        Mock Register-ScheduledTask { throw 'unmocked Register-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Unregister-ScheduledTask { throw 'unmocked Unregister-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Disable-ScheduledTask { throw 'unmocked Disable-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Enable-ScheduledTask { throw 'unmocked Enable-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Start-ScheduledTask { throw 'unmocked Start-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Stop-ScheduledTask { throw 'unmocked Stop-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
+        Mock Set-ScheduledTask { throw 'unmocked Set-ScheduledTask reached -- every test that reaches a Scheduled Task cmdlet must mock it' }
     }
 
     AfterEach {
@@ -34,6 +57,11 @@ Describe 'install.ps1' -Tag 'Quick' {
     }
 
     Context 'Test-InstallPrerequisites' {
+
+        BeforeEach {
+            # Every It below is independent of the runner's own Windows identity.
+            Mock Get-OperatorAccountProblem { '' }
+        }
 
         It 'returns an actionable "re-run as Administrator" problem when not elevated' {
             Mock Test-IsElevatedProcess { $false }
@@ -84,9 +112,96 @@ Describe 'install.ps1' -Tag 'Quick' {
             Mock Get-Command { [pscustomobject]@{ Source = 'C:\ffmpeg\ffmpeg.exe' } } -ParameterFilter { $Name -eq 'ffmpeg' }
             Mock Get-FfmpegProtocolsOutput { 'Supported protocols: ... srt ...' }
 
+            # Plain assignment, no @() wrapper around the call (unary-comma contract).
             $problems = Test-InstallPrerequisites
 
             @($problems).Count | Should -Be 0
+            # No-arg call: OperatorUserName defaults to the running identity.
+            Should -Invoke Get-OperatorAccountProblem -Times 1 -Exactly -ParameterFilter {
+                $OperatorUserName -eq [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            }
+        }
+
+        It 'includes the operator-account problem when Get-OperatorAccountProblem reports one' {
+            Mock Test-IsElevatedProcess { $true }
+            Mock Get-Command { [pscustomobject]@{ Source = 'C:\pwsh\pwsh.exe' } } -ParameterFilter { $Name -eq 'pwsh.exe' }
+            Mock Get-Command { [pscustomobject]@{ Source = 'C:\ffmpeg\ffmpeg.exe' } } -ParameterFilter { $Name -eq 'ffmpeg' }
+            Mock Get-FfmpegProtocolsOutput { 'Supported protocols: ... srt ...' }
+            Mock Get-OperatorAccountProblem { 'operator problem' }
+
+            $problems = Test-InstallPrerequisites -OperatorUserName 'TESTPC\operator'
+
+            $problems | Should -Contain 'operator problem'
+        }
+    }
+
+    Context 'Get-OperatorAccountProblem' {
+        # Real NTAccount translation: safe non-elevated, touches no task.
+
+        It 'reports a problem naming SYSTEM for NT AUTHORITY\SYSTEM' {
+            $problem = Get-OperatorAccountProblem -OperatorUserName 'NT AUTHORITY\SYSTEM'
+
+            $problem | Should -Not -BeNullOrEmpty
+            $problem | Should -Match 'SYSTEM'
+        }
+
+        It 'reports a problem for an account that cannot be resolved' {
+            $unresolvableName = "NoSuchDomain-$([Guid]::NewGuid())\nobody-$([Guid]::NewGuid())"
+
+            $problem = Get-OperatorAccountProblem -OperatorUserName $unresolvableName
+
+            $problem | Should -Not -BeNullOrEmpty
+            $problem | Should -Match 'cannot be resolved'
+        }
+
+        It 'returns an empty string for the current identity' {
+            $currentIdentityName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+            Get-OperatorAccountProblem -OperatorUserName $currentIdentityName | Should -Be ''
+        }
+
+        It 'reports a service-account-or-group problem for <AccountName>' -ForEach @(
+            @{ AccountName = 'NT AUTHORITY\LOCAL SERVICE' }
+            @{ AccountName = 'NT AUTHORITY\NETWORK SERVICE' }
+            @{ AccountName = 'BUILTIN\Administrators' }
+        ) {
+            $problem = Get-OperatorAccountProblem -OperatorUserName $AccountName
+
+            $problem | Should -Not -BeNullOrEmpty
+            $problem | Should -Match 'service account or group, not a user'
+        }
+
+        It 'reports a blank-account problem instead of throwing when the name is "<AccountName>"' -ForEach @(
+            @{ AccountName = '' }
+            @{ AccountName = '   ' }
+        ) {
+            # A direct call: a throw from parameter binding fails this test on its own.
+            $problem = Get-OperatorAccountProblem -OperatorUserName $AccountName
+
+            $problem | Should -Match 'blank'
+            $problem | Should -Match '-OperatorUserName'
+        }
+
+        It 'Test-InstallPrerequisites keeps its never-throws contract and lists the blank account as a problem' {
+            Mock Test-IsElevatedProcess { $true }
+            Mock Get-Command { [pscustomobject]@{ Source = 'C:\pwsh\pwsh.exe' } } -ParameterFilter { $Name -eq 'pwsh.exe' }
+            Mock Get-Command { [pscustomobject]@{ Source = 'C:\ffmpeg\ffmpeg.exe' } } -ParameterFilter { $Name -eq 'ffmpeg' }
+            Mock Get-FfmpegProtocolsOutput { 'Supported protocols: ... srt ...' }
+
+            $problems = Test-InstallPrerequisites -OperatorUserName ''
+
+            @($problems).Count | Should -Be 1
+            $problems[0] | Should -Match 'blank'
+        }
+    }
+
+    Context 'ConvertTo-WallClockStartBoundary' {
+
+        It 'builds an offset-free local wall-clock boundary for the given day' {
+            $boundary = ConvertTo-WallClockStartBoundary -TimeOfDay '04:05' -Today ([datetime]'2026-10-25')
+
+            $boundary | Should -BeExactly '2026-10-25T04:05:00'
+            $boundary | Should -Not -Match '([+-]\d\d:\d\d|Z)$'
         }
     }
 
@@ -96,7 +211,7 @@ Describe 'install.ps1' -Tag 'Quick' {
         # test stopped at Test-InstallPrerequisites. That gap hid a real installer
         # crash: an empty problems list collapsed to $null, so `$problems.Count`
         # threw under Set-StrictMode -Version Latest and install.ps1 died before
-        # Register-PusherScheduledTask ever ran. The installer therefore worked
+        # Register-SupervisorScheduledTask ever ran. The installer therefore worked
         # only when prerequisites FAILED. These tests assert the flow itself, not
         # the shape of the problems list, and must never wrap the result in @() --
         # @($null).Count is 0, which is exactly what masked the bug.
@@ -108,6 +223,8 @@ Describe 'install.ps1' -Tag 'Quick' {
             Mock Get-FfmpegProtocolsOutput { 'Supported protocols: ... srt ...' }
             Mock Get-ScheduledTask { $null }
             Mock Register-ScheduledTask { }
+            Mock Get-OperatorAccountProblem { '' }
+            Mock Remove-LegacySupervisorScheduledTask { }
             # Invoke-Install passes install.ps1's own $PSScriptRoot (the real repo
             # root) to Initialize-PusherEnvFile -- mock it so the operator's real
             # .env is never a participant in this test.
@@ -115,23 +232,66 @@ Describe 'install.ps1' -Tag 'Quick' {
         }
 
         It 'does not throw when every prerequisite passes' {
-            { Invoke-Install } | Should -Not -Throw
+            { Invoke-Install -OperatorUserName 'TESTPC\operator' } | Should -Not -Throw
         }
 
         It 'registers the Scheduled Task when every prerequisite passes' {
-            Invoke-Install
+            Invoke-Install -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -Exactly
         }
 
+        It 'registers the supervisor task under the name GaplessSupervisor' {
+            Invoke-Install -OperatorUserName 'TESTPC\operator'
+
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'GaplessSupervisor' }
+        }
+
         It 'performs the first-run .env copy before registering' {
-            Invoke-Install
+            Invoke-Install -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Initialize-PusherEnvFile -Times 1 -Exactly
         }
 
         It 'returns the success exit code when every prerequisite passes' {
-            Invoke-Install | Should -Be 0
+            Invoke-Install -OperatorUserName 'TESTPC\operator' | Should -Be 0
+        }
+
+        It 'removes the legacy task only after the new registration, and still returns 0' {
+            $script:callOrder = [System.Collections.Generic.List[string]]::new()
+            Mock Register-SupervisorScheduledTask { $script:callOrder.Add('register') }
+            Mock Remove-LegacySupervisorScheduledTask { $script:callOrder.Add('remove-legacy') }
+
+            $exitCode = Invoke-Install -OperatorUserName 'TESTPC\operator'
+
+            @($script:callOrder) | Should -Be @('register', 'remove-legacy')
+            $exitCode | Should -Be 0
+        }
+
+        It 'returns the distinct exit code 3 and logs "Install incomplete" instead of "Install complete" when the legacy task was left running' {
+            Mock Remove-LegacySupervisorScheduledTask { $true }
+            $script:capturedLogLines = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Log { $script:capturedLogLines.Add("$Level|$Message") }
+
+            $exitCode = Invoke-Install -OperatorUserName 'TESTPC\operator'
+
+            $exitCode | Should -Be 3
+            @($script:capturedLogLines | Where-Object { $_ -like 'Error|Install incomplete -- action required*' }).Count | Should -Be 1
+            @($script:capturedLogLines | Where-Object { $_ -like '*Install complete*' }).Count | Should -Be 0
+        }
+
+        It 'returns 0 when the legacy task removal reports it was not left running' {
+            Mock Remove-LegacySupervisorScheduledTask { $false }
+
+            Invoke-Install -OperatorUserName 'TESTPC\operator' | Should -Be 0
+        }
+
+        It 'never reaches legacy removal when the registration throws (never zero supervisor tasks)' {
+            Mock Register-SupervisorScheduledTask { throw 'simulated registration failure' }
+
+            { Invoke-Install -OperatorUserName 'TESTPC\operator' } | Should -Throw
+
+            Should -Invoke Remove-LegacySupervisorScheduledTask -Times 0 -Exactly
         }
     }
 
@@ -143,6 +303,8 @@ Describe 'install.ps1' -Tag 'Quick' {
             Mock Get-FfmpegProtocolsOutput { 'Supported protocols: ... srt ...' }
             Mock Get-ScheduledTask { $null }
             Mock Register-ScheduledTask { }
+            Mock Get-OperatorAccountProblem { '' }
+            Mock Remove-LegacySupervisorScheduledTask { }
             Mock Initialize-PusherEnvFile { }
         }
 
@@ -153,14 +315,15 @@ Describe 'install.ps1' -Tag 'Quick' {
             # never relied upon. Pin the real contract: abort, register nothing.
             Mock Test-IsElevatedProcess { $false }
 
-            Invoke-Install | Should -Be 1
+            Invoke-Install -OperatorUserName 'TESTPC\operator' | Should -Be 1
 
             Should -Invoke Register-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Remove-LegacySupervisorScheduledTask -Times 0 -Exactly
             Should -Invoke Initialize-PusherEnvFile -Times 0 -Exactly
         }
     }
 
-    Context 'Register-PusherScheduledTask' {
+    Context 'Register-SupervisorScheduledTask' {
 
         BeforeEach {
             Mock Get-Command { [pscustomobject]@{ Source = 'C:\Program Files\PowerShell\7\pwsh.exe' } } -ParameterFilter { $Name -eq 'pwsh.exe' }
@@ -169,24 +332,24 @@ Describe 'install.ps1' -Tag 'Quick' {
         }
 
         It 'registers exactly one task on a fresh install (no existing task)' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -Exactly
         }
 
         It 'still results in exactly one registration per call when an existing task of the same name is found (idempotent rerun, no duplicate, no throw)' {
-            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher' } }
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSupervisor' } }
 
-            { Register-PusherScheduledTask -ScriptRoot $TestDrive } | Should -Not -Throw
-            { Register-PusherScheduledTask -ScriptRoot $TestDrive } | Should -Not -Throw
+            { Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator' } | Should -Not -Throw
+            { Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator' } | Should -Not -Throw
 
             Should -Invoke Register-ScheduledTask -Times 2 -Exactly
         }
 
-        It 'is registered under the fixed TaskName GaplessSrtPusher' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+        It 'is registered under the fixed TaskName GaplessSupervisor' {
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
-            Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter { $TaskName -eq 'GaplessSrtPusher' }
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'GaplessSupervisor' }
         }
 
         It 'builds the Action with the absolute resolved pwsh path, explicit WorkingDirectory, and -ExecutionPolicy Bypass -NoProfile -File (absolute supervisor.ps1 path)' {
@@ -199,7 +362,7 @@ Describe 'install.ps1' -Tag 'Quick' {
             $script:capturedAction = $null
             Mock Register-ScheduledTask -MockWith { $script:capturedAction = $Action }
 
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             $expectedScriptPath = Join-Path $TestDrive 'supervisor.ps1'
             $script:capturedAction.Execute | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
@@ -209,39 +372,161 @@ Describe 'install.ps1' -Tag 'Quick' {
             $script:capturedAction.WorkingDirectory | Should -Be $TestDrive
         }
 
-        It 'uses an -AtStartup trigger' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+        It 'uses a boot trigger plus an offset-free daily 04:05 watchdog trigger' {
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
-                $Trigger[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger'
+                $Trigger.Count -eq 2 -and
+                $Trigger[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' -and
+                $Trigger[1].CimClass.CimClassName -eq 'MSFT_TaskDailyTrigger' -and
+                $Trigger[1].DaysInterval -eq 1 -and
+                $Trigger[1].StartBoundary -match 'T04:05:00$' -and
+                $Trigger[1].StartBoundary -notmatch '([+-]\d\d:\d\d|Z)$'
             }
         }
 
-        It 'uses SYSTEM/ServiceAccount/Highest principal' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+        It 'repeats the daily watchdog trigger every 5 minutes for 1 day and never stops a running supervisor at the end of the repetition (Tier 2, 261018)' {
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
-                $Principal.UserId -eq 'SYSTEM' -and
-                $Principal.LogonType -eq 'ServiceAccount' -and
-                $Principal.RunLevel -eq 'Highest'
+                $Trigger[1].Repetition.Interval -eq 'PT5M' -and
+                $Trigger[1].Repetition.Duration -eq 'P1D' -and
+                $Trigger[1].Repetition.StopAtDurationEnd -eq $false
             }
         }
 
-        It 'sets bounded RestartCount/RestartInterval and MultipleInstances IgnoreNew' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+        It 'runs as the operator account with S4U logon and Limited run level' {
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
-                $Settings.RestartCount -gt 0 -and
+                $Principal.UserId -eq 'TESTPC\operator' -and
+                $Principal.LogonType -eq 'S4U' -and
+                $Principal.RunLevel -eq 'Limited'
+            }
+        }
+
+        It 'sets no execution time limit, battery-proof flags, restart settings and MultipleInstances IgnoreNew' {
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
+
+            Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
+                $Settings.ExecutionTimeLimit -eq 'PT0S' -and
+                $Settings.DisallowStartIfOnBatteries -eq $false -and
+                $Settings.StopIfGoingOnBatteries -eq $false -and
+                $Settings.StartWhenAvailable -and
+                $Settings.RestartCount -eq 999 -and
                 $Settings.MultipleInstances -eq 'IgnoreNew'
             }
         }
 
         It 'passes the -Force switch for idempotent overwrite (SVC-02)' {
-            Register-PusherScheduledTask -ScriptRoot $TestDrive
+            Register-SupervisorScheduledTask -ScriptRoot $TestDrive -OperatorUserName 'TESTPC\operator'
 
             Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
                 $Force -eq $true
             }
+        }
+    }
+
+    Context 'Remove-LegacySupervisorScheduledTask' {
+
+        It 'touches nothing when the legacy task is absent' {
+            Mock Get-ScheduledTask { $null }
+            Mock Disable-ScheduledTask { }
+            Mock Unregister-ScheduledTask { }
+
+            Remove-LegacySupervisorScheduledTask
+
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Disable-ScheduledTask -Times 0 -Exactly
+        }
+
+        It 'unregisters the legacy task once when it is <State>' -ForEach @(
+            @{ State = 'Ready' }
+            @{ State = 'Disabled' }
+        ) {
+            $legacyState = $State
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher'; State = $legacyState } }
+            Mock Disable-ScheduledTask { }
+            Mock Unregister-ScheduledTask { }
+
+            Remove-LegacySupervisorScheduledTask
+
+            Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+                $TaskName -eq 'GaplessSrtPusher' -and $Confirm -eq $false
+            }
+            Should -Invoke Disable-ScheduledTask -Times 0 -Exactly
+        }
+
+        It 'disables (never unregisters, never stops) a running legacy task and warns that the process was left alone' {
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher'; State = 'Running' } }
+            Mock Disable-ScheduledTask { }
+            Mock Unregister-ScheduledTask { }
+            $script:capturedWarnings = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Log -ParameterFilter { $Level -eq 'Warning' } -MockWith { $script:capturedWarnings.Add($Message) }
+
+            $null = Remove-LegacySupervisorScheduledTask
+
+            Should -Invoke Disable-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'GaplessSrtPusher' }
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Stop-ScheduledTask -Times 0 -Exactly
+            $script:capturedWarnings.Count | Should -Be 1
+            $script:capturedWarnings[0] | Should -Match 'GaplessSrtPusher'
+            $script:capturedWarnings[0] | Should -Match 'left alone'
+        }
+
+        It 'reports that a legacy task was left running, and only then' {
+            Mock Disable-ScheduledTask { }
+            Mock Unregister-ScheduledTask { }
+            Mock Write-Log { }
+
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher'; State = 'Running' } }
+            @(Remove-LegacySupervisorScheduledTask) | Should -Contain $true
+
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher'; State = 'Ready' } }
+            @(Remove-LegacySupervisorScheduledTask) | Should -Not -Contain $true
+
+            Mock Get-ScheduledTask { $null }
+            @(Remove-LegacySupervisorScheduledTask) | Should -Not -Contain $true
+        }
+
+        It 'logs the last run time, the scheduler kill deadline and an actionable remedy for a running legacy task, without calling it a second supervisor' {
+            Mock Get-ScheduledTask {
+                [pscustomobject]@{
+                    TaskName = 'GaplessSrtPusher'
+                    State    = 'Running'
+                    Settings = [pscustomobject]@{ ExecutionTimeLimit = 'PT72H' }
+                }
+            }
+            Mock Get-ScheduledTaskInfo { [pscustomobject]@{ LastRunTime = [datetime]'2026-10-17T04:05:00' } }
+            Mock Disable-ScheduledTask { }
+            Mock Unregister-ScheduledTask { }
+            $script:capturedWarnings = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Log -ParameterFilter { $Level -eq 'Warning' } -MockWith { $script:capturedWarnings.Add($Message) }
+
+            $null = Remove-LegacySupervisorScheduledTask
+
+            $script:capturedWarnings.Count | Should -Be 1
+            $script:capturedWarnings[0] | Should -Match '2026-10-17 04:05:00'
+            $script:capturedWarnings[0] | Should -Match '2026-10-20 04:05:00'
+            $script:capturedWarnings[0] | Should -Match 'reboot'
+            $script:capturedWarnings[0] | Should -Match 'no-stream window'
+            $script:capturedWarnings[0] | Should -Match 'then re-run install.ps1 to delete the task'
+            $script:capturedWarnings[0] | Should -Match 'is still running a supervisor \(possibly the only one\)'
+            $script:capturedWarnings[0] | Should -Not -Match 'second supervisor'
+            $script:capturedWarnings[0] | Should -Not -Match 'after the service'
+        }
+
+        It 'still warns when the run details cannot be read' {
+            Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'GaplessSrtPusher'; State = 'Running' } }
+            Mock Get-ScheduledTaskInfo { throw 'simulated task info failure' }
+            Mock Disable-ScheduledTask { }
+            $script:capturedWarnings = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Log -ParameterFilter { $Level -eq 'Warning' } -MockWith { $script:capturedWarnings.Add($Message) }
+
+            { $null = Remove-LegacySupervisorScheduledTask } | Should -Not -Throw
+
+            $script:capturedWarnings.Count | Should -Be 1
+            $script:capturedWarnings[0] | Should -Match 'unknown'
         }
     }
 
@@ -299,6 +584,36 @@ Describe 'install.ps1' -Tag 'Quick' {
 
             Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
                 $Trigger[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger'
+            }
+        }
+
+        It 'adds an offset-free daily 04:00 watchdog trigger after the boot trigger' {
+            Register-TunnelScheduledTask -ScriptRoot $TestDrive
+
+            Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
+                $Trigger.Count -eq 2 -and
+                $Trigger[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' -and
+                $Trigger[1].CimClass.CimClassName -eq 'MSFT_TaskDailyTrigger' -and
+                $Trigger[1].StartBoundary -match 'T04:00:00$' -and
+                $Trigger[1].StartBoundary -notmatch '([+-]\d\d:\d\d|Z)$'
+            }
+        }
+
+        It 'does not repeat its daily trigger (the five-minute watchdog belongs to the supervisor task only, 261018)' {
+            Register-TunnelScheduledTask -ScriptRoot $TestDrive
+
+            Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
+                ($null -eq $Trigger[1].Repetition) -or [string]::IsNullOrEmpty($Trigger[1].Repetition.Interval)
+            }
+        }
+
+        It 'has no execution time limit and survives battery power (regression lock for the 2026-08-02 72 h kill)' {
+            Register-TunnelScheduledTask -ScriptRoot $TestDrive
+
+            Should -Invoke Register-ScheduledTask -Times 1 -ParameterFilter {
+                $Settings.ExecutionTimeLimit -eq 'PT0S' -and
+                $Settings.DisallowStartIfOnBatteries -eq $false -and
+                $Settings.StopIfGoingOnBatteries -eq $false
             }
         }
 

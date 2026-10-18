@@ -81,6 +81,9 @@ Describe 'Invoke-Probe (probes/vps.psm1) against a real local SRT listener' -Tag
         { $script:downResult = Invoke-Probe -Config $config } | Should -Not -Throw
 
         $script:downResult.status | Should -Be 'down'
-        $script:downResult.metrics | Should -BeNullOrEmpty
+        # Every return path carries the fixed indicator rows (probes/vps.psm1 contract), so
+        # 'down' is proven by the absence of a measured Latency row, not by empty metrics.
+        ($script:downResult.metrics | Where-Object { $_.label -match 'Latency' }) | Should -BeNullOrEmpty
+        ($script:downResult.metrics | Where-Object { $_.label -eq 'Port' }).value | Should -Be 'closed'
     }
 }

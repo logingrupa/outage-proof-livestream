@@ -31,7 +31,7 @@ The leftmost hop (OBS writing to disk) never leaves the machine — the `.ts` fi
    - `RELAY_HOST` / `RELAY_PORT` — the VPS relay's address and port
 3. Run `install.ps1` from an elevated (Administrator) PowerShell prompt.
 
-`install.ps1` is honest about what it does and does not do: it registers a Windows Scheduled Task (`GaplessSrtPusher`) that starts the supervisor at boot. The supervisor comes up **idle** and streams nothing until an operator explicitly presses Start on the dashboard.
+`install.ps1` is honest about what it does and does not do: it registers a Windows Scheduled Task (`GaplessSupervisor`) that starts the supervisor at boot. The task runs `supervisor.ps1` as the account that ran the elevated installer (or the one passed as `-OperatorUserName`) under S4U, so it runs at boot before anyone logs on and stores no password. It has a boot trigger, a daily 04:05 watchdog and no execution time limit. The daily watchdog repeats every 5 minutes, so a supervisor that died is relaunched within 5 minutes, and a running one is never touched. A legacy `GaplessSrtPusher` task from older installs is removed automatically. The supervisor comes up **idle** and streams nothing until an operator explicitly presses Start on the dashboard.
 
 ## Quickstart — VPS (the relay)
 

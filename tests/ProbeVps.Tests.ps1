@@ -752,7 +752,7 @@ Describe 'Invoke-SmoothRelayStatusCheck combined systemctl+ss parsing (260809-oc
         }
     }
 
-    It '-RelayPort supplied (the tcp path) -> the remote command chains systemctl, the separator, then ss filtered on that exact port' {
+    It '-RelayPort supplied (the tcp path) -> the remote command chains systemctl, the separator, then ss filtered on that exact port, then (260830-ffp/D-01) a second separator and the egress loop' {
         Mock Invoke-SshCommand -ModuleName vps -MockWith {
             [pscustomobject]@{ TimedOut = $false; OutputLines = @('active', 'active', 'active', '---', 'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*'); Detail = $null }
         }
@@ -763,7 +763,223 @@ Describe 'Invoke-SmoothRelayStatusCheck combined systemctl+ss parsing (260809-oc
 
         Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly -ParameterFilter {
             $remoteCommand = $ArgumentList[$ArgumentList.Count - 1]
-            $remoteCommand -eq "systemctl is-active smooth-ingest-tcp.service smooth-youtube@lv.service smooth-youtube@ru.service; echo ---; ss -Htan '( sport = :8890 )'"
+            $expectedEgressLoop = 'for c in lv ru; do mp=$(systemctl show -p MainPID --value smooth-youtube@$c.service); fp=$(pgrep -P ${mp:-0} -x ffmpeg | head -1); printf "%s " "$c"; if [ -n "$fp" ]; then ss -Htinp state established "( dport = :443 )" | grep -A1 "pid=$fp," | grep -o -e "bytes_sent:[0-9]*" -e "lastsnd:[0-9]*" | tr "\n" " "; fi; echo; done'
+            # 260906-i2k/D-09 regression-lock update: a THIRD separator plus the
+            # reader-health `cat` now close the tcp path's remote command.
+            $expectedReaderHealthSection = 'cat /run/smooth-watchdog/reader-health 2>/dev/null'
+            $remoteCommand -eq "systemctl is-active smooth-ingest-tcp.service smooth-youtube@lv.service smooth-youtube@ru.service; echo ---; ss -Htan '( sport = :8890 )'; echo ---; $expectedEgressLoop; echo ---; $expectedReaderHealthSection"
+        }
+    }
+}
+
+Describe 'Invoke-SmoothRelayStatusCheck egress section parsing (260830-ffp: VPS-to-YouTube egress indicator rows, D-01/D-02/D-03/D-07)' -Tag 'Quick' {
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'aligned reply, both channels sending -> EgressStates has 2 entries with correct HasConnection/LastSendMilliseconds/BytesSent; UnitStates and PortState unaffected; exactly 1 SSH call' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0      128          0.0.0.0:8890      0.0.0.0:*', '---',
+                    'lv bytes_sent:336846364 lastsnd:8 ', 'ru bytes_sent:338086939 lastsnd:20 '
+                )
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates | Should -HaveCount 2
+        $result.EgressStates[0].ChannelId | Should -Be 'lv'
+        $result.EgressStates[0].HasConnection | Should -BeTrue
+        $result.EgressStates[0].LastSendMilliseconds | Should -Be 8
+        $result.EgressStates[0].BytesSent | Should -Be 336846364
+        $result.EgressStates[1].ChannelId | Should -Be 'ru'
+        $result.EgressStates[1].HasConnection | Should -BeTrue
+        $result.EgressStates[1].LastSendMilliseconds | Should -Be 20
+        $result.EgressStates[1].BytesSent | Should -Be 338086939
+        $result.UnitStates[0].State | Should -Be 'active'
+        $result.PortState | Should -Be 'open'
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'a channel with no established socket -> that entry has HasConnection false and null LastSendMilliseconds/BytesSent, the other entry unaffected' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0      128          0.0.0.0:8890      0.0.0.0:*', '---',
+                    'lv bytes_sent:336846364 lastsnd:8 ', 'ru '
+                )
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates[1].ChannelId | Should -Be 'ru'
+        $result.EgressStates[1].HasConnection | Should -BeFalse
+        $result.EgressStates[1].LastSendMilliseconds | Should -BeNullOrEmpty
+        $result.EgressStates[1].BytesSent | Should -BeNullOrEmpty
+        $result.EgressStates[0].HasConnection | Should -BeTrue
+    }
+
+    It 'second separator absent entirely -> EgressStates is null, all three UnitStates still resolve, PortState still resolves, exactly 1 SSH call (D-03)' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @('active', 'active', 'active', '---', 'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*')
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates | Should -BeNullOrEmpty
+        $result.UnitStates | ForEach-Object { $_.State | Should -Be 'active' }
+        $result.PortState | Should -Be 'open'
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'egress line count does not match channel count -> EgressStates null, units and port intact, exactly 1 SSH call' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*', '---',
+                    'lv bytes_sent:336846364 lastsnd:8 '
+                )
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates | Should -BeNullOrEmpty
+        $result.UnitStates | ForEach-Object { $_.State | Should -Be 'active' }
+        $result.PortState | Should -Be 'open'
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'a channel-id prefix out of order (ru listed first) -> EgressStates null, units and port intact, exactly 1 SSH call' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*', '---',
+                    'ru bytes_sent:338086939 lastsnd:20 ', 'lv bytes_sent:336846364 lastsnd:8 '
+                )
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates | Should -BeNullOrEmpty
+        $result.UnitStates | ForEach-Object { $_.State | Should -Be 'active' }
+        $result.PortState | Should -Be 'open'
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'FIRST separator absent entirely (existing contract, regression lock) -> everything unknown, exactly 2 SSH calls' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{ TimedOut = $false; OutputLines = @('active', 'active', 'active'); Detail = $null }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.UnitStates | ForEach-Object { $_.State | Should -BeNullOrEmpty }
+        $result.PortState | Should -BeNullOrEmpty
+        $result.EgressStates | Should -BeNullOrEmpty
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 2 -Exactly
+    }
+
+    It '-RelayPort supplied (the tcp path) -> the remote command chains systemctl, the separator, the ss port query, a second separator, then the egress loop naming both channel ids' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*', '---',
+                    'lv bytes_sent:336846364 lastsnd:8 ', 'ru bytes_sent:338086939 lastsnd:20 '
+                )
+                Detail      = $null
+            }
+        }
+
+        InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890 | Out-Null
+        }
+
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly -ParameterFilter {
+            $remoteCommand = $ArgumentList[$ArgumentList.Count - 1]
+            $expectedEgressLoop = 'for c in lv ru; do mp=$(systemctl show -p MainPID --value smooth-youtube@$c.service); fp=$(pgrep -P ${mp:-0} -x ffmpeg | head -1); printf "%s " "$c"; if [ -n "$fp" ]; then ss -Htinp state established "( dport = :443 )" | grep -A1 "pid=$fp," | grep -o -e "bytes_sent:[0-9]*" -e "lastsnd:[0-9]*" | tr "\n" " "; fi; echo; done'
+            # 260906-i2k/D-09 regression-lock update: a THIRD separator plus the
+            # reader-health `cat` now close the tcp path's remote command.
+            $expectedReaderHealthSection = 'cat /run/smooth-watchdog/reader-health 2>/dev/null'
+            $remoteCommand -eq "systemctl is-active smooth-ingest-tcp.service smooth-youtube@lv.service smooth-youtube@ru.service; echo ---; ss -Htan '( sport = :8890 )'; echo ---; $expectedEgressLoop; echo ---; $expectedReaderHealthSection"
+        }
+    }
+
+    It 'tcp path remote command survives PowerShell verbatim: the last argv element still contains the literal ${mp:-0} default expression and the literal pid=$fp, comma fragment from the reference command (proves D-07 single-quoted literal)' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @('active', 'active', 'active', '---', '---', 'lv ', 'ru ')
+                Detail      = $null
+            }
+        }
+
+        InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890 | Out-Null
+        }
+
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly -ParameterFilter {
+            $remoteCommand = $ArgumentList[$ArgumentList.Count - 1]
+            ($remoteCommand -match [regex]::Escape('${mp:-0}')) -and
+            ($remoteCommand -match [regex]::Escape('pid=$fp,'))
+        }
+    }
+
+    It 'srt path remote command (no -RelayPort) is unchanged from today: no separator, no ss, no egress loop' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{ TimedOut = $false; OutputLines = @('active', 'active', 'active'); Detail = $null }
+        }
+
+        InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 | Out-Null
+        }
+
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly -ParameterFilter {
+            $remoteCommand = $ArgumentList[$ArgumentList.Count - 1]
+            ($remoteCommand -eq 'systemctl is-active smooth-ingest-tcp.service smooth-youtube@lv.service smooth-youtube@ru.service') -and
+            ($remoteCommand -notmatch 'ss -Ht') -and
+            ($remoteCommand -notmatch '---') -and
+            ($remoteCommand -notmatch 'for c in')
         }
     }
 }
@@ -1089,6 +1305,174 @@ Describe 'Invoke-Probe status fold (D-09, CHUR-02 three-level grading; redesigne
     }
 }
 
+Describe 'Invoke-Probe egress metric rows (260830-ffp, D-04/D-05)' -Tag 'Quick' {
+
+    BeforeAll {
+        function New-VpsEgressTestConfig {
+            [pscustomobject]@{
+                RelayHost = '127.0.0.1'; RelayPort = 8890; RelayProtocol = 'tcp'
+                ProbeVpsSshHost = 'vps.example.com'; ProbeVpsSshUser = 'church'
+                ProbeVpsSshKeyPath = 'C:\keys\id_ed25519'; ProbeVpsSshPort = 22
+            }
+        }
+
+        function Mock-VpsEgressTestLegs {
+            param([AllowNull()] [array] $EgressStates)
+            Mock Test-LocalTunnelProcessAlive -ModuleName vps { [pscustomobject]@{ Running = $true; Detail = $null } }
+            Mock Get-Command -ModuleName vps { [pscustomobject]@{ Name = 'ssh.exe' } } -ParameterFilter { $Name -eq 'ssh.exe' }
+            Mock Test-SmoothRelayHealth -ModuleName vps {
+                [pscustomobject]@{
+                    UnitStates   = @(
+                        [pscustomobject]@{ UnitName = 'smooth-ingest-tcp.service'; State = 'active' }
+                        [pscustomobject]@{ UnitName = 'smooth-youtube@lv.service'; State = 'active' }
+                        [pscustomobject]@{ UnitName = 'smooth-youtube@ru.service'; State = 'active' }
+                    )
+                    PortState    = 'open'
+                    EgressStates = $EgressStates
+                    Detail       = $null
+                }
+            }.GetNewClosure()
+        }
+    }
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'sending: lastsnd 8ms, bytes 336846364 -> "YT LV out" value "sending", unit "321 MB"' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 336846364 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 20; BytesSent = 338086939 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        $lvRow = $result.metrics | Where-Object { $_.label -eq 'YT LV out' }
+        $lvRow.value | Should -Be 'sending'
+        $lvRow.unit | Should -Be '321 MB'
+    }
+
+    It 'stalled: lastsnd 25000ms -> value "stalled 25s"' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 25000; BytesSent = 1000000 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 20; BytesSent = 1000000 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        ($result.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'stalled 25s'
+    }
+
+    It 'no established socket -> value "no connection", unit ""' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $false; LastSendMilliseconds = $null; BytesSent = $null }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 20; BytesSent = 1000000 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        $lvRow = $result.metrics | Where-Object { $_.label -eq 'YT LV out' }
+        $lvRow.value | Should -Be 'no connection'
+        $lvRow.unit | Should -Be ''
+    }
+
+    It 'EgressStates unresolved (null) -> value "unknown" for both rows' {
+        Mock-VpsEgressTestLegs -EgressStates $null
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        ($result.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'unknown'
+        ($result.metrics | Where-Object { $_.label -eq 'YT RU out' }).value | Should -Be 'unknown'
+    }
+
+    It 'SSH leg not configured -> value "not configured" for both rows' {
+        Mock Test-LocalTunnelProcessAlive -ModuleName vps { [pscustomobject]@{ Running = $true; Detail = $null } }
+
+        $config = [pscustomobject]@{
+            RelayHost = '127.0.0.1'; RelayPort = 8890; RelayProtocol = 'tcp'
+            ProbeVpsSshHost = ''; ProbeVpsSshUser = ''; ProbeVpsSshKeyPath = ''
+        }
+
+        $result = Invoke-Probe -Config $config
+
+        ($result.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'not configured'
+        ($result.metrics | Where-Object { $_.label -eq 'YT RU out' }).value | Should -Be 'not configured'
+    }
+
+    It 'srt path -> value "not applicable" for both rows' {
+        Mock Test-SrtInductionReachability -ModuleName vps { [pscustomobject]@{ Reachable = $true; LatencyMilliseconds = 5.0; Detail = $null } }
+
+        $config = [pscustomobject]@{
+            RelayHost = '127.0.0.1'; RelayPort = 8890
+            ProbeVpsSshHost = ''; ProbeVpsSshUser = ''; ProbeVpsSshKeyPath = ''
+        }
+
+        $result = Invoke-Probe -Config $config
+
+        ($result.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'not applicable'
+        ($result.metrics | Where-Object { $_.label -eq 'YT RU out' }).value | Should -Be 'not applicable'
+    }
+
+    It 'byte formatting: below 1 GB renders whole MB, at/above 1 GB renders one-decimal GB, both invariant-culture' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 500000000 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 25130000000 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        ($result.metrics | Where-Object { $_.label -eq 'YT LV out' }).unit | Should -Be '477 MB'
+        ($result.metrics | Where-Object { $_.label -eq 'YT RU out' }).unit | Should -Be '23.4 GB'
+    }
+
+    It 'status fold unchanged (D-05): all units active, Port open, both channels stalled 40s -> status stays ok' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 40000; BytesSent = 1000000 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 40000; BytesSent = 1000000 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        $result.status | Should -Be 'ok'
+    }
+
+    It 'status fold unchanged (D-05): both channels no-connection -> status stays ok' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $false; LastSendMilliseconds = $null; BytesSent = $null }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $false; LastSendMilliseconds = $null; BytesSent = $null }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        $result.status | Should -Be 'ok'
+    }
+
+    It 'row order: first five labels are Ingest/YouTube LV/YouTube RU/Tunnel/Port, egress rows come after every pre-existing row' {
+        Mock-VpsEgressTestLegs -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 1000000 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 1000000 }
+        )
+
+        $result = Invoke-Probe -Config (New-VpsEgressTestConfig)
+
+        $labels = @($result.metrics | ForEach-Object { $_.label })
+        $labels[0..4] | Should -Be @('Ingest', 'YouTube LV', 'YouTube RU', 'Tunnel', 'Port')
+        $labels[5] | Should -Be 'YT LV out'
+        $labels[6] | Should -Be 'YT RU out'
+        # 260906-i2k/D-11 regression-lock update: the two reader-health rows are appended
+        # AFTER the egress rows, Rotations first. Not a weakening -- the pre-existing five
+        # rows and both egress rows are still asserted at their exact indices above.
+        $labels[7] | Should -Be 'Rotations'
+        $labels[8] | Should -Be 'Discontinuities'
+        $labels | Should -HaveCount 9
+    }
+}
+
 Describe 'Get-SshLegCacheFilePath (260809-oc4)' -Tag 'Quick' {
 
     BeforeEach {
@@ -1163,17 +1547,25 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
                 [AllowNull()] $YouTubeLvState = 'active',
                 [AllowNull()] $YouTubeRuState = 'active',
                 [AllowNull()] $PortState = 'open',
+                # 260830-ffp: untyped for the same null-coercion reason documented above --
+                # $null means "egress unresolved this tick", an array means aligned states.
+                [AllowNull()] $EgressStates = $null,
+                # 260906-i2k: untyped for the same null-coercion reason documented above --
+                # $null means "reader health unresolved this tick".
+                [AllowNull()] $ReaderHealth = $null,
                 [AllowNull()] $Detail = $null
             )
             Mock Test-SmoothRelayHealth -ModuleName vps {
                 [pscustomobject]@{
-                    UnitStates = @(
+                    UnitStates   = @(
                         [pscustomobject]@{ UnitName = 'smooth-ingest-tcp.service'; State = $IngestState }
                         [pscustomobject]@{ UnitName = 'smooth-youtube@lv.service'; State = $YouTubeLvState }
                         [pscustomobject]@{ UnitName = 'smooth-youtube@ru.service'; State = $YouTubeRuState }
                     )
-                    PortState  = $PortState
-                    Detail     = $Detail
+                    PortState    = $PortState
+                    EgressStates = $EgressStates
+                    ReaderHealth = $ReaderHealth
+                    Detail       = $Detail
                 }
             }.GetNewClosure()
         }
@@ -1243,6 +1635,28 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
         ($secondResult.metrics | Where-Object { $_.label -eq 'Port' }).value | Should -Be 'in use'
     }
 
+    It '(260830-ffp) two consecutive Invoke-Probe calls with a cache-capable Config invoke Test-SmoothRelayHealth exactly 1 time, and both results carry IDENTICAL egress row values (D-06)' {
+        Set-VpsThrottleTestLegMocks
+        Mock-VpsThrottleTestSshCheck -EgressStates @(
+            [pscustomobject]@{ ChannelId = 'lv'; HasConnection = $true; LastSendMilliseconds = 8; BytesSent = 336846364 }
+            [pscustomobject]@{ ChannelId = 'ru'; HasConnection = $false; LastSendMilliseconds = $null; BytesSent = $null }
+        )
+
+        $stateFilePath = Join-Path (New-VpsThrottleTestStateDirectory) 'offset.json'
+        $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
+
+        $firstResult = Invoke-Probe -Config $config
+        $secondResult = Invoke-Probe -Config $config
+
+        Should -Invoke Test-SmoothRelayHealth -ModuleName vps -Times 1 -Exactly
+        ($firstResult.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'sending'
+        ($secondResult.metrics | Where-Object { $_.label -eq 'YT LV out' }).value | Should -Be 'sending'
+        ($firstResult.metrics | Where-Object { $_.label -eq 'YT LV out' }).unit | Should -Be '321 MB'
+        ($secondResult.metrics | Where-Object { $_.label -eq 'YT LV out' }).unit | Should -Be '321 MB'
+        ($firstResult.metrics | Where-Object { $_.label -eq 'YT RU out' }).value | Should -Be 'no connection'
+        ($secondResult.metrics | Where-Object { $_.label -eq 'YT RU out' }).value | Should -Be 'no connection'
+    }
+
     It 'the cache file sits beside StateFilePath after one poll, and a sibling state/probes/ directory gains no new *.json file' {
         Set-VpsThrottleTestLegMocks
         Mock-VpsThrottleTestSshCheck
@@ -1283,7 +1697,7 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
 
         $nowMonotonicSeconds = InModuleScope vps { Get-MonotonicSeconds }
         $expiredCachePayload = [ordered]@{
-            schemaVersion              = 2
+            schemaVersion              = 4
             observedAtMonotonicSeconds = ($nowMonotonicSeconds - 120)
             unitNames                  = @('smooth-ingest-tcp.service', 'smooth-youtube@lv.service', 'smooth-youtube@ru.service')
             unitStates                 = @(
@@ -1292,6 +1706,11 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
                 [ordered]@{ unitName = 'smooth-youtube@ru.service'; state = 'active' }
             )
             portState                  = 'open'
+            egressStates               = @(
+                [ordered]@{ channelId = 'lv'; hasConnection = $true; lastSendMilliseconds = 8; bytesSent = 336846364 }
+                [ordered]@{ channelId = 'ru'; hasConnection = $true; lastSendMilliseconds = 20; bytesSent = 338086939 }
+            )
+            readerHealth               = [ordered]@{ discontinuities = 0; rotations = 0 }
             detail                     = $null
         }
         $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
@@ -1312,7 +1731,7 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
 
         $nowMonotonicSeconds = InModuleScope vps { Get-MonotonicSeconds }
         $futureCachePayload = [ordered]@{
-            schemaVersion              = 2
+            schemaVersion              = 4
             observedAtMonotonicSeconds = ($nowMonotonicSeconds + 500)
             unitNames                  = @('smooth-ingest-tcp.service', 'smooth-youtube@lv.service', 'smooth-youtube@ru.service')
             unitStates                 = @(
@@ -1321,6 +1740,11 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
                 [ordered]@{ unitName = 'smooth-youtube@ru.service'; state = 'active' }
             )
             portState                  = 'open'
+            egressStates               = @(
+                [ordered]@{ channelId = 'lv'; hasConnection = $true; lastSendMilliseconds = 8; bytesSent = 336846364 }
+                [ordered]@{ channelId = 'ru'; hasConnection = $true; lastSendMilliseconds = 20; bytesSent = 338086939 }
+            )
+            readerHealth               = [ordered]@{ discontinuities = 0; rotations = 0 }
             detail                     = $null
         }
         $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
@@ -1345,7 +1769,7 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
         # exercises the same discard-and-retry path.
         $nowMonotonicSeconds = InModuleScope vps { Get-MonotonicSeconds }
         $mismatchedNameCachePayload = [ordered]@{
-            schemaVersion              = 2
+            schemaVersion              = 4
             observedAtMonotonicSeconds = $nowMonotonicSeconds
             unitNames                  = @('smooth-ingest-tcp.service', 'some-other-relay-channel-a.service', 'some-other-relay-channel-b.service')
             unitStates                 = @(
@@ -1354,6 +1778,11 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
                 [ordered]@{ unitName = 'some-other-relay-channel-b.service'; state = 'active' }
             )
             portState                  = 'open'
+            egressStates               = @(
+                [ordered]@{ channelId = 'lv'; hasConnection = $true; lastSendMilliseconds = 8; bytesSent = 336846364 }
+                [ordered]@{ channelId = 'ru'; hasConnection = $true; lastSendMilliseconds = 20; bytesSent = 338086939 }
+            )
+            readerHealth               = [ordered]@{ discontinuities = 0; rotations = 0 }
             detail                     = $null
         }
         $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
@@ -1386,6 +1815,35 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
         }
         $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
         ($preRedesignCachePayload | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $cacheFilePath
+
+        Invoke-Probe -Config $config | Out-Null
+
+        Should -Invoke Test-SmoothRelayHealth -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'a cache written at schemaVersion=2 (portState present, no egressStates field -- 260830-ffp/D-06) is discarded automatically -- the SSH leg runs again' {
+        Set-VpsThrottleTestLegMocks
+        Mock-VpsThrottleTestSshCheck
+
+        $stateDirectory = New-VpsThrottleTestStateDirectory
+        $stateFilePath = Join-Path $stateDirectory 'offset.json'
+        $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
+
+        $nowMonotonicSeconds = InModuleScope vps { Get-MonotonicSeconds }
+        $schemaVersion2CachePayload = [ordered]@{
+            schemaVersion              = 2
+            observedAtMonotonicSeconds = $nowMonotonicSeconds
+            unitNames                  = @('smooth-ingest-tcp.service', 'smooth-youtube@lv.service', 'smooth-youtube@ru.service')
+            unitStates                 = @(
+                [ordered]@{ unitName = 'smooth-ingest-tcp.service'; state = 'active' }
+                [ordered]@{ unitName = 'smooth-youtube@lv.service'; state = 'active' }
+                [ordered]@{ unitName = 'smooth-youtube@ru.service'; state = 'active' }
+            )
+            portState                  = 'open'
+            detail                     = $null
+        }
+        $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
+        ($schemaVersion2CachePayload | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $cacheFilePath
 
         Invoke-Probe -Config $config | Out-Null
 
@@ -1443,5 +1901,427 @@ Describe 'SSH-leg 60-second throttle with disk-backed cache (260809-oc4, extende
         $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
 
         { Invoke-Probe -Config $config } | Should -Not -Throw
+    }
+
+    It '260906-i2k/D-11: a cache round trip preserves both reader-health counts -- the second poll reuses them without re-running the SSH leg' {
+        Set-VpsThrottleTestLegMocks
+        Mock-VpsThrottleTestSshCheck -ReaderHealth ([pscustomobject]@{ Discontinuities = 7; Rotations = 3 })
+
+        $stateFilePath = Join-Path (New-VpsThrottleTestStateDirectory) 'offset.json'
+        $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
+
+        Invoke-Probe -Config $config | Out-Null
+        $cachedResult = Invoke-Probe -Config $config
+
+        Should -Invoke Test-SmoothRelayHealth -ModuleName vps -Times 1 -Exactly
+        $rotationsRow = $cachedResult.metrics | Where-Object { $_.label -eq 'Rotations' }
+        $rotationsRow.value | Should -Be 'warn'
+        $rotationsRow.unit | Should -Be '3'
+        $discontinuitiesRow = $cachedResult.metrics | Where-Object { $_.label -eq 'Discontinuities' }
+        $discontinuitiesRow.value | Should -Be 'warn'
+        $discontinuitiesRow.unit | Should -Be '7'
+    }
+
+    It '260906-i2k/D-11: a null reader-health round-trips as null -- the restored rows read "unknown", never a fabricated zero pair' {
+        Set-VpsThrottleTestLegMocks
+        Mock-VpsThrottleTestSshCheck -ReaderHealth $null
+
+        $stateFilePath = Join-Path (New-VpsThrottleTestStateDirectory) 'offset.json'
+        $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
+
+        Invoke-Probe -Config $config | Out-Null
+        $cachedResult = Invoke-Probe -Config $config
+
+        Should -Invoke Test-SmoothRelayHealth -ModuleName vps -Times 1 -Exactly
+        $rotationsRow = $cachedResult.metrics | Where-Object { $_.label -eq 'Rotations' }
+        $rotationsRow.value | Should -Be 'unknown'
+        $rotationsRow.unit | Should -Be ''
+    }
+
+    It '260906-i2k/D-11: a cache written at schemaVersion=3 (egressStates present, no readerHealth field) is discarded automatically -- the SSH leg runs again' {
+        Set-VpsThrottleTestLegMocks
+        Mock-VpsThrottleTestSshCheck
+
+        $stateDirectory = New-VpsThrottleTestStateDirectory
+        $stateFilePath = Join-Path $stateDirectory 'offset.json'
+        $config = New-VpsThrottleTestConfig -StateFilePath $stateFilePath
+
+        $nowMonotonicSeconds = InModuleScope vps { Get-MonotonicSeconds }
+        $schemaVersion3CachePayload = [ordered]@{
+            schemaVersion              = 3
+            observedAtMonotonicSeconds = $nowMonotonicSeconds
+            unitNames                  = @('smooth-ingest-tcp.service', 'smooth-youtube@lv.service', 'smooth-youtube@ru.service')
+            unitStates                 = @(
+                [ordered]@{ unitName = 'smooth-ingest-tcp.service'; state = 'active' }
+                [ordered]@{ unitName = 'smooth-youtube@lv.service'; state = 'active' }
+                [ordered]@{ unitName = 'smooth-youtube@ru.service'; state = 'active' }
+            )
+            portState                  = 'open'
+            egressStates               = @(
+                [ordered]@{ channelId = 'lv'; hasConnection = $true; lastSendMilliseconds = 8; bytesSent = 336846364 }
+                [ordered]@{ channelId = 'ru'; hasConnection = $true; lastSendMilliseconds = 20; bytesSent = 338086939 }
+            )
+            detail                     = $null
+        }
+        $cacheFilePath = Join-Path $stateDirectory 'vps-probe-ssh-cache.json'
+        ($schemaVersion3CachePayload | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $cacheFilePath
+
+        Invoke-Probe -Config $config | Out-Null
+
+        Should -Invoke Test-SmoothRelayHealth -ModuleName vps -Times 1 -Exactly
+    }
+}
+
+Describe 'ConvertTo-VpsReaderHealthState (260906-i2k: reader-health section parsing, D-09/D-10)' -Tag 'Quick' {
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'an aligned two-line payload yields both counts as integers' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('discontinuities=4', 'rotations=2')
+        }
+
+        $state.Discontinuities | Should -Be 4
+        $state.Rotations | Should -Be 2
+    }
+
+    It 'parses BY KEY, not by line position -- a reversed key order yields the same result' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('rotations=2', 'discontinuities=4')
+        }
+
+        $state.Discontinuities | Should -Be 4
+        $state.Rotations | Should -Be 2
+    }
+
+    It 'tolerates surrounding whitespace around the key, the equals sign and the value' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('  discontinuities = 4  ', ' rotations =2 ')
+        }
+
+        $state.Discontinuities | Should -Be 4
+        $state.Rotations | Should -Be 2
+    }
+
+    It 'zero counts are a REAL observation, not an unresolved one' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('discontinuities=0', 'rotations=0')
+        }
+
+        $state | Should -Not -BeNullOrEmpty
+        $state.Discontinuities | Should -Be 0
+        $state.Rotations | Should -Be 0
+    }
+
+    It 'a missing key resolves the WHOLE state to $null -- never a half-populated object' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('discontinuities=4')
+        }
+
+        $state | Should -BeNullOrEmpty
+    }
+
+    It 'a non-integer value resolves to $null (T-i2k-01: digits only, nothing from the remote payload is trusted)' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('discontinuities=lots', 'rotations=2')
+        }
+
+        $state | Should -BeNullOrEmpty
+    }
+
+    It 'a negative value resolves to $null -- the digits-only regex rejects the sign' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @('discontinuities=-1', 'rotations=2')
+        }
+
+        $state | Should -BeNullOrEmpty
+    }
+
+    It 'an empty section (the watchdog has not ticked yet, or the file is absent) resolves to $null' {
+        $state = InModuleScope vps {
+            ConvertTo-VpsReaderHealthState -ReaderHealthLines @()
+        }
+
+        $state | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Invoke-SmoothRelayStatusCheck reader-health slicing (260906-i2k, D-09/D-10)' -Tag 'Quick' {
+
+    BeforeAll {
+        function New-VpsReaderHealthReplyLines {
+            param([string[]] $TrailingLines)
+            @(
+                'active', 'active', 'active', '---',
+                'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*', '---',
+                'lv bytes_sent:336846364 lastsnd:8 ', 'ru bytes_sent:338086939 lastsnd:20 '
+            ) + $TrailingLines
+        }
+    }
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'a reply carrying the third separator parses reader health WITHOUT changing unit states, Port state or egress states' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = @(
+                    'active', 'active', 'active', '---',
+                    'LISTEN 0 128 0.0.0.0:8890 0.0.0.0:*', '---',
+                    'lv bytes_sent:336846364 lastsnd:8 ', 'ru bytes_sent:338086939 lastsnd:20 ', '---',
+                    'discontinuities=4', 'rotations=2'
+                )
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        @($result.UnitStates | ForEach-Object { $_.State }) | Should -Be @('active', 'active', 'active')
+        $result.PortState | Should -Be 'open'
+        $result.EgressStates | Should -HaveCount 2
+        $result.EgressStates[0].BytesSent | Should -Be 336846364
+        $result.ReaderHealth.Discontinuities | Should -Be 4
+        $result.ReaderHealth.Rotations | Should -Be 2
+    }
+
+    It 'a reply WITHOUT the third separator parses egress exactly as before -- the egress slice still runs to end-of-reply, and reader health is $null' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = (New-VpsReaderHealthReplyLines -TrailingLines @())
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.EgressStates | Should -HaveCount 2
+        $result.EgressStates[0].ChannelId | Should -Be 'lv'
+        $result.EgressStates[1].BytesSent | Should -Be 338086939
+        $result.PortState | Should -Be 'open'
+        $result.ReaderHealth | Should -BeNullOrEmpty
+    }
+
+    It 'a malformed reader-health section resolves ReaderHealth to $null and NOTHING else (D-10) -- egress and Port are untouched and no retry is triggered' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = (New-VpsReaderHealthReplyLines -TrailingLines @('---', 'discontinuities=nope'))
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.ReaderHealth | Should -BeNullOrEmpty
+        $result.PortState | Should -Be 'open'
+        $result.EgressStates | Should -HaveCount 2
+        @($result.UnitStates | ForEach-Object { $_.State }) | Should -Be @('active', 'active', 'active')
+        # The retry contract is what proves "NOTHING else": a malformed reader-health
+        # section must never look like a truncated reply.
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'an empty reader-health section (the remote file does not exist yet) resolves ReaderHealth to $null without a retry' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{
+                TimedOut    = $false
+                OutputLines = (New-VpsReaderHealthReplyLines -TrailingLines @('---'))
+                Detail      = $null
+            }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22 -RelayPort 8890
+        }
+
+        $result.ReaderHealth | Should -BeNullOrEmpty
+        $result.EgressStates | Should -HaveCount 2
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly
+    }
+
+    It 'the srt break-glass path (no RelayPort) never asks for a reader-health section and its remote command carries no cat at all' {
+        Mock Invoke-SshCommand -ModuleName vps -MockWith {
+            [pscustomobject]@{ TimedOut = $false; OutputLines = @('active', 'active', 'active'); Detail = $null }
+        }
+
+        $result = InModuleScope vps {
+            Test-SmoothRelayHealth -SshHost 'vps.example.com' -SshUser 'church' -SshKeyPath 'C:\keys\id_ed25519' -SshPort 22
+        }
+
+        $result.ReaderHealth | Should -BeNullOrEmpty
+        Should -Invoke Invoke-SshCommand -ModuleName vps -Times 1 -Exactly -ParameterFilter {
+            $remoteCommand = $ArgumentList[$ArgumentList.Count - 1]
+            ($remoteCommand -eq 'systemctl is-active smooth-ingest-tcp.service smooth-youtube@lv.service smooth-youtube@ru.service') -and
+            ($remoteCommand -notmatch 'reader-health')
+        }
+    }
+}
+
+Describe 'Resolve-VpsReaderHealthRowValue (260906-i2k, D-11 branch order)' -Tag 'Quick' {
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'srt path -> "not applicable", outranking every later branch even with a real count present' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $false -SshConfigured $true -SshExecutableAvailable $true -Count 5
+        } | Should -Be 'not applicable'
+    }
+
+    It 'tcp path, SSH leg not configured -> "not configured"' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $true -SshConfigured $false -SshExecutableAvailable $true -Count 5
+        } | Should -Be 'not configured'
+    }
+
+    It 'tcp path, configured, ssh.exe absent -> "unknown"' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $true -SshConfigured $true -SshExecutableAvailable $false -Count 5
+        } | Should -Be 'unknown'
+    }
+
+    It 'tcp path, configured, ssh.exe present, count unresolved -> "unknown"' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $true -SshConfigured $true -SshExecutableAvailable $true -Count $null
+        } | Should -Be 'unknown'
+    }
+
+    It 'a count of zero -> "ok"' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $true -SshConfigured $true -SshExecutableAvailable $true -Count 0
+        } | Should -Be 'ok'
+    }
+
+    It 'any count above zero -> "warn"' {
+        InModuleScope vps {
+            Resolve-VpsReaderHealthRowValue -IsTcpPath $true -SshConfigured $true -SshExecutableAvailable $true -Count 1
+        } | Should -Be 'warn'
+    }
+}
+
+Describe 'Invoke-Probe reader-health metric rows (260906-i2k, D-10/D-11)' -Tag 'Quick' {
+
+    BeforeAll {
+        function New-VpsReaderHealthProbeConfig {
+            [pscustomobject]@{
+                RelayHost = '127.0.0.1'; RelayPort = 8890; RelayProtocol = 'tcp'
+                ProbeVpsSshHost = 'vps.example.com'; ProbeVpsSshUser = 'church'
+                ProbeVpsSshKeyPath = 'C:\keys\id_ed25519'; ProbeVpsSshPort = 22
+            }
+        }
+
+        function Mock-VpsReaderHealthProbeLegs {
+            param([AllowNull()] $ReaderHealth)
+            Mock Test-LocalTunnelProcessAlive -ModuleName vps { [pscustomobject]@{ Running = $true; Detail = $null } }
+            Mock Get-Command -ModuleName vps { [pscustomobject]@{ Name = 'ssh.exe' } } -ParameterFilter { $Name -eq 'ssh.exe' }
+            Mock Test-SmoothRelayHealth -ModuleName vps {
+                [pscustomobject]@{
+                    UnitStates   = @(
+                        [pscustomobject]@{ UnitName = 'smooth-ingest-tcp.service'; State = 'active' }
+                        [pscustomobject]@{ UnitName = 'smooth-youtube@lv.service'; State = 'active' }
+                        [pscustomobject]@{ UnitName = 'smooth-youtube@ru.service'; State = 'active' }
+                    )
+                    PortState    = 'open'
+                    EgressStates = $null
+                    ReaderHealth = $ReaderHealth
+                    Detail       = $null
+                }
+            }.GetNewClosure()
+        }
+    }
+
+    BeforeEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+        Import-Module $script:VpsProbeModulePath -Force
+    }
+
+    AfterEach {
+        Remove-Module vps -ErrorAction SilentlyContinue
+    }
+
+    It 'both rows exist, in Rotations-then-Discontinuities order, immediately after the egress rows' {
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth ([pscustomobject]@{ Discontinuities = 0; Rotations = 0 })
+
+        $result = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        $labels = @($result.metrics | ForEach-Object { $_.label })
+        $labels[5] | Should -Be 'YT LV out'
+        $labels[6] | Should -Be 'YT RU out'
+        $labels[7] | Should -Be 'Rotations'
+        $labels[8] | Should -Be 'Discontinuities'
+    }
+
+    It 'zero counts render "ok" with the count in the unit field' {
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth ([pscustomobject]@{ Discontinuities = 0; Rotations = 0 })
+
+        $result = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        $rotationsRow = $result.metrics | Where-Object { $_.label -eq 'Rotations' }
+        $rotationsRow.value | Should -Be 'ok'
+        $rotationsRow.unit | Should -Be '0'
+    }
+
+    It 'non-zero counts render "warn" with the exact integer count as the unit' {
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth ([pscustomobject]@{ Discontinuities = 12; Rotations = 3 })
+
+        $result = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        $rotationsRow = $result.metrics | Where-Object { $_.label -eq 'Rotations' }
+        $rotationsRow.value | Should -Be 'warn'
+        $rotationsRow.unit | Should -Be '3'
+        $discontinuitiesRow = $result.metrics | Where-Object { $_.label -eq 'Discontinuities' }
+        $discontinuitiesRow.value | Should -Be 'warn'
+        $discontinuitiesRow.unit | Should -Be '12'
+    }
+
+    It 'an unresolved reader health renders both rows "unknown" with a BLANK unit -- never a fabricated zero' {
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth $null
+
+        $result = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        foreach ($rowLabel in @('Rotations', 'Discontinuities')) {
+            $row = $result.metrics | Where-Object { $_.label -eq $rowLabel }
+            $row.value | Should -Be 'unknown'
+            $row.unit | Should -Be ''
+        }
+    }
+
+    It 'D-10: the folded status is IDENTICAL with and without reader health, and warn counts never degrade an otherwise-ok probe' {
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth $null
+        $withoutReaderHealth = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        Mock-VpsReaderHealthProbeLegs -ReaderHealth ([pscustomobject]@{ Discontinuities = 99; Rotations = 42 })
+        $withWarnCounts = Invoke-Probe -Config (New-VpsReaderHealthProbeConfig)
+
+        $withoutReaderHealth.status | Should -Be 'ok'
+        $withWarnCounts.status | Should -Be $withoutReaderHealth.status
     }
 }

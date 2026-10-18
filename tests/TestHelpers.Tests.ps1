@@ -16,6 +16,67 @@ BeforeAll {
     $script:TestHelpersModulePath = Join-Path $PSScriptRoot 'TestHelpers.psm1'
 }
 
+Describe 'New-TestTunedPusherCopy production isolation (261018, Pusher mutex scope)' -Tag 'Quick' {
+
+    # pusher.ps1 names its per-install Pusher mutex from $pusherSingleInstanceScopeRoot,
+    # which defaults to the script's own directory. A tuned copy is written into the repo
+    # root, so a copy that kept that default would take the PRODUCTION Pusher mutex when
+    # the suite runs from the live install, and the live supervisor's orphan probe would
+    # then refuse to launch its pusher. Every tuned copy must scope the mutex to a
+    # throwaway path instead.
+
+    BeforeAll {
+        Import-Module $script:TestHelpersModulePath -Force
+        $script:TunedCopyPaths = [System.Collections.Generic.List[string]]::new()
+
+        function New-IsolationCheckTunedCopy {
+            $tunedCopyPath = New-TestTunedPusherCopy -RecordingFilePath (Join-Path $TestDrive 'recordings/service.ts') -RelayPort 1 -StateFilePath (Join-Path $TestDrive 'offset.json')
+            $script:TunedCopyPaths.Add($tunedCopyPath)
+            return $tunedCopyPath
+        }
+
+        function Get-TunedCopyScopeRoot {
+            param([Parameter(Mandatory)] [string] $TunedCopyPath)
+
+            $scopeMatch = [regex]::Match((Get-Content -LiteralPath $TunedCopyPath -Raw), "(?m)^\`$pusherSingleInstanceScopeRoot = '([^']+)'\s*$")
+            if (-not $scopeMatch.Success) { return $null }
+            return $scopeMatch.Groups[1].Value
+        }
+    }
+
+    AfterAll {
+        foreach ($tunedCopyPath in $script:TunedCopyPaths) {
+            Remove-Item -LiteralPath $tunedCopyPath -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Module TestHelpers -ErrorAction SilentlyContinue
+    }
+
+    It 'pusher.ps1 derives the Pusher mutex name from a single top-of-script scope variable, not from $PSScriptRoot directly' {
+        $pusherSourceText = Get-Content -LiteralPath (Join-Path $script:RepoRootPath 'pusher.ps1') -Raw
+
+        $pusherSourceText | Should -Match '(?m)^\$pusherSingleInstanceScopeRoot = \$PSScriptRoot\s*$'
+        $pusherSourceText | Should -Match "Get-SupervisorSingleInstanceMutexName -ScriptRoot \`$pusherSingleInstanceScopeRoot -Role 'Pusher'"
+        $pusherSourceText | Should -Not -Match "Get-SupervisorSingleInstanceMutexName -ScriptRoot \`$PSScriptRoot -Role 'Pusher'"
+    }
+
+    It 'a tuned copy never scopes the Pusher mutex to the repo root: it is a unique path under the temp directory' {
+        $tunedCopyPath = New-IsolationCheckTunedCopy
+
+        $scopeRoot = Get-TunedCopyScopeRoot -TunedCopyPath $tunedCopyPath
+        $scopeRoot | Should -Not -BeNullOrEmpty -Because 'the tuned copy must rewrite $pusherSingleInstanceScopeRoot to a literal path'
+        $scopeRoot | Should -Not -Be $script:RepoRootPath
+        $scopeRoot.StartsWith($script:RepoRootPath, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
+        $scopeRoot.StartsWith([System.IO.Path]::GetTempPath().TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+    }
+
+    It 'two tuned copies get different scopes, so their Pusher mutexes can never collide with each other either' {
+        $firstScopeRoot = Get-TunedCopyScopeRoot -TunedCopyPath (New-IsolationCheckTunedCopy)
+        $secondScopeRoot = Get-TunedCopyScopeRoot -TunedCopyPath (New-IsolationCheckTunedCopy)
+
+        $firstScopeRoot | Should -Not -Be $secondScopeRoot
+    }
+}
+
 Describe 'Start-SrtListener stderr capture (the receiver-side witness)' -Tag 'Integration' {
 
     BeforeEach {

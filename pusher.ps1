@@ -33,6 +33,9 @@ $ErrorActionPreference = 'Stop'
 # failure (D-08), distinct from an unexpected crash (any other non-zero exit,
 # e.g. an uncaught exception) so a config-error restart storm is
 # distinguishable from a transient crash in Task Scheduler's history (T-04-13).
+# Code 4 (261018) = another pusher of this install holds the per-install Pusher mutex;
+# this one stood down before it touched the offset, the control flag, the recording or
+# ffmpeg, so the supervisor waits instead of counting a crash.
 # ---------------------------------------------------------------------------
 $script:ExitCodeConfigError = 2
 # Front C (260718-j58/Task 3/EOS-DRAIN-01): a bounded end-of-service give-up with
@@ -41,6 +44,19 @@ $script:ExitCodeConfigError = 2
 # supervisor.ps1 can map it to its own honest StayDown reason
 # ('finished-with-undelivered-backlog') rather than either of those two existing tokens.
 $script:ExitCodeUndeliveredBacklog = 3
+# Another pusher for this install is already running (261018, B6): the per-install Pusher
+# mutex is held. Exiting here, before any state is touched, is what makes a supervisor
+# relaunch safe next to a pusher that outlived its supervisor.
+$script:ExitCodeAnotherPusherRunning = 4
+# How long a starting pusher waits for the Pusher mutex before standing down. Long enough
+# for a predecessor that is still releasing it (a cut and an immediate start); short
+# enough that a genuine duplicate does not linger.
+$script:PusherSingleInstanceWaitSeconds = 15
+# The directory that names this install's Pusher mutex. Production: the script's own
+# directory, the same root the supervisor derives its probe name from. A single
+# top-of-script line so tests that run a scratch copy of this script from the repo root
+# can point it at a throwaway path and never take the production mutex.
+$pusherSingleInstanceScopeRoot = $PSScriptRoot
 # The single terminal exit-code holder (Task 4 sets this to 3 on a bounded drain
 # give-up); a fully-drained finish leaves it at 0, matching the pre-existing contract.
 $script:pusherTerminalExitCode = 0
@@ -86,6 +102,19 @@ if ($configProblems.Count -gt 0) {
 # on Logging.psm1's own internal default.
 Set-LogDirectory -Path (Join-Path $PSScriptRoot 'state/logs')
 Set-LogRotationPolicy -MaxSizeBytes $config.LogMaxSizeBytes -RetentionCount $config.LogRetentionCount
+
+# Single-instance guard (261018, B6): one pusher per install. A supervisor that died
+# mid-service can leave its pusher running, and the five-minute watchdog then starts a new
+# supervisor; two pushers on one recording would replay old content to YouTube
+# (2026-09-13). The guard sits before the 'Config loaded' line and every hot-path import,
+# so a loser has touched no offset, control flag, recording or ffmpeg when it exits. A
+# crashed or killed holder leaves the mutex abandoned, which counts as free.
+Import-Module (Join-Path $PSScriptRoot 'lib/SupervisorSingleInstance.psm1') -Force
+$script:PusherSingleInstanceMutex = Enter-SupervisorSingleInstance -MutexName (Get-SupervisorSingleInstanceMutexName -ScriptRoot $pusherSingleInstanceScopeRoot -Role 'Pusher') -WaitSeconds $script:PusherSingleInstanceWaitSeconds
+if ($null -eq $script:PusherSingleInstanceMutex) {
+    Write-Log -Level Warning -Message "Another pusher for this install ('$PSScriptRoot') is already running ($(Get-ProcessIdentityLogText)) -- this pusher exits without touching the offset, the control flag, the recording or ffmpeg."
+    exit $script:ExitCodeAnotherPusherRunning
+}
 
 # Redacted config summary (D-07/T-04-12): the SRT passphrase is never logged,
 # set or blank -- Get-RedactedConfig masks it before this line ever sees it.
@@ -507,7 +536,7 @@ function Start-Pusher {
     [CmdletBinding()]
     param()
 
-    Write-Log -Level Info -Message "Pusher starting -- recordingFolder='$recordingFolderPath' filenameGlob='$recordingFilenameGlob' relay=$relayHost`:$relayPort streamId=$streamId"
+    Write-Log -Level Info -Message "Pusher starting ($(Get-ProcessIdentityLogText)) -- recordingFolder='$recordingFolderPath' filenameGlob='$recordingFilenameGlob' relay=$relayHost`:$relayPort streamId=$streamId"
 
     # 260718-epo/FEAT-B: captured ONCE at Start-Pusher entry (system-wide monotonic,
     # comparable across the supervisor/dashboard process, D-A3) and threaded through
@@ -1678,7 +1707,13 @@ function Start-Pusher {
     }
 }
 
-Start-Pusher
+try {
+    Start-Pusher
+} finally {
+    # A crash still exits non-zero and a hard kill skips this on purpose: the mutex is then
+    # abandoned, which the next pusher and the supervisor's probe both count as free.
+    Exit-SupervisorSingleInstance -Mutex $script:PusherSingleInstanceMutex
+}
 # Front C (260718-j58/Task 3/Task 4): a fully-drained finish leaves the holder at its
 # initialized 0 (unchanged pre-existing contract); a bounded end-of-service give-up with
 # undelivered backlog (Task 4) sets it to $script:ExitCodeUndeliveredBacklog (3) before
